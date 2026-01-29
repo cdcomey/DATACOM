@@ -309,21 +309,27 @@ impl Axes {
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
+#[serde(default)]
 struct TerrainConfig {
-    #[serde(default="default_terrain_z_pos")]
     z_pos: f32,
-    
-    #[serde(default="default_terrain_width")]
     width: u32,
-
-    #[serde(default="default_terrain_color")]
     color: [f32; 3],
 }
 
 fn default_terrain_z_pos() -> f32 { -3.0 }
 fn default_terrain_width() -> u32 { 1000 }
-fn default_terrain_color() -> [f32; 3] { [1.0, 0.0, 0.0] }
+fn default_terrain_color() -> [f32; 3] { [255.0, 0.0, 0.0] }
+
+impl Default for TerrainConfig {
+    fn default() -> Self {
+        TerrainConfig {
+            z_pos: default_terrain_z_pos(),
+            width: default_terrain_width(),
+            color: default_terrain_color(),
+        }
+    }
+}
 
 pub struct Terrain {
     // position: Rc<RefCell<Point3<f32>>>,
@@ -349,6 +355,7 @@ impl Terrain {
         // ];
 
         let config: TerrainConfig = serde_json::from_value(json).unwrap_or_default();
+        log::debug!("Terrain Config = {}, {}, {:?}", config.z_pos, config.width, config.color);
 
         let mut vertices: Vec<ModelVertex> = vec![];
         let min: i32 = config.width as i32 / -2;

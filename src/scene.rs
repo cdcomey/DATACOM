@@ -160,6 +160,32 @@ impl Viewport {
         }
     }
 
+    fn default(
+        device: &wgpu::Device, 
+        camera_bind_group_layout: &wgpu::BindGroupLayout, 
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
+    ) -> Self {
+        use cgmath::{Deg, Quaternion, Rotation3};
+        let camera_yaw = Quaternion::from_angle_z(Deg(-45.0));
+        let camera_pitch = Quaternion::from_angle_x(Deg(-45.0));
+        let camera_roll = Quaternion::from_angle_y(Deg(0.0));
+        let camera_rotation = camera_yaw * camera_roll * camera_pitch;
+        let camera = camera::Camera::new((0.0, -5.0, 5.0), camera_rotation);
+
+        Viewport::new(
+            0.0,
+            0.0,
+            1600.0,
+            1200.0,
+            camera,
+            device,
+            camera_bind_group_layout,
+            ortho_matrix_bind_group_layout,
+            cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0),
+            BorderAlignment::FullScreen,
+        )
+    }
+
     fn load_from_json(
         json: &serde_json::Value, 
         device: &wgpu::Device, 
@@ -579,8 +605,15 @@ impl Scene {
         }
 
         let terrain = model::Terrain::new(serde_json::Value::Null, &device);
+        // let terrain = model::Terrain::load_from_hdf5();
 
-        let viewports = vec![];
+        let viewports = vec![
+            Viewport::default(
+                device,
+                camera_bind_group_layout,
+                ortho_matrix_bind_group_layout
+            )
+        ];
 
         let num_entities = entity_vec.len();
         println!("LOADED {} ENTITIES INTO SCENE", num_entities);
