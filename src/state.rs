@@ -423,8 +423,23 @@ impl<'a> State<'a> {
             self.surface.configure(&self.device, &self.config);
         }
     }
+
+    pub fn device_input(&mut self, event: &DeviceEvent) -> bool {
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if self.mouse_pressed {
+                    for viewport in &mut self.scene.viewports {
+                        viewport.camera_controller.process_mouse(delta.0, delta.1);
+                    }
+                }
+            }
+            _ => {}
+        };
+
+        true
+    }
     
-    pub fn input(&mut self, event: &WindowEvent) -> bool {
+    pub fn window_input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput {
                 event:
@@ -444,7 +459,6 @@ impl<'a> State<'a> {
                 state,
                 ..
             } => {
-                println!("mouse press detected in state.rs");
                 self.mouse_pressed = *state == ElementState::Pressed;
                 true
             }

@@ -320,7 +320,11 @@ impl Viewport {
         render_pass.draw(0..Viewport::NUM_VERTICES, 0..1);
     }
 
-    pub fn update_camera(&mut self, dt: std::time::Duration, queue: &wgpu::Queue){
+    pub fn update_camera(
+        &mut self, 
+        dt: std::time::Duration, 
+        queue: &wgpu::Queue
+    ){
         self.camera_controller.update_camera(dt);
         self.camera_uniform.update_view_proj(&self.camera_controller.camera(), &self.projection);
         // log::info!("{:?}", viewport.camera_uniform);

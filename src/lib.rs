@@ -45,16 +45,15 @@ pub async fn run_scene_from_json(args: Vec<String>) {
         .run(move |event, control_flow| {
             match event {
                 Event::DeviceEvent {
-                    event: DeviceEvent::MouseMotion{ delta, },
+                    ref event,
                     .. // We're not using device_id currently
-                } => if state.mouse_pressed {
-                    println!("mouse press detected in lib.rs");
-                    // state.viewports[0].camera_controller.process_mouse(delta.0, delta.1)
+                } => {
+                    state.device_input(event);
                 }
                 Event::WindowEvent {
                     ref event,
                     window_id,
-                } if window_id == state.window().id() && !state.input(event) => {
+                } if window_id == state.window().id() && !state.window_input(event) => {
                     match event {
                         WindowEvent::CloseRequested
                         | WindowEvent::KeyboardInput {
@@ -169,15 +168,15 @@ pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
         .run(move |event, control_flow| {
             match event {
                 Event::DeviceEvent {
-                    event: DeviceEvent::MouseMotion{ delta, },
+                    ref event,
                     .. // We're not using device_id currently
-                } => if state.mouse_pressed {
-                    // state.scene.viewports[0].camera_controller.process_mouse(delta.0, delta.1)
+                } => {
+                    state.device_input(event);
                 }
                 Event::WindowEvent {
                     ref event,
                     window_id,
-                } if window_id == state.window().id() && !state.input(event) => {
+                } if window_id == state.window().id() && !state.window_input(event) => {
                     match event {
                         WindowEvent::CloseRequested
                         | WindowEvent::KeyboardInput {
@@ -287,15 +286,15 @@ pub async fn run_scene_from_network(args: Vec<String>){
         .run(move |event, control_flow| {
             match event {
                 Event::DeviceEvent {
-                    event: DeviceEvent::MouseMotion{ delta, },
+                    ref event,
                     .. // We're not using device_id currently
-                } => if state.mouse_pressed {
-                    // state.viewports[0].camera_controller.process_mouse(delta.0, delta.1)
+                } => {
+                    state.device_input(event);
                 }
                 Event::WindowEvent {
                     ref event,
                     window_id,
-                } if window_id == state.window().id() && !state.input(event) => {
+                } if window_id == state.window().id() && !state.window_input(event) => {
                     match event {
                         WindowEvent::CloseRequested
                         | WindowEvent::KeyboardInput {
