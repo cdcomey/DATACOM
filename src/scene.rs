@@ -1,16 +1,337 @@
 
 use text::{TextDisplay};
-use std::sync::Arc;
 use log::{debug, info};
 use std::process::{Command, Stdio};
 use std::io::Write;
+use std::sync::Arc;
+use cgmath::Matrix4;
+use wgpu::util::DeviceExt;
 
-use crate::{model, com, text, behaviors_and_entities};
+use crate::{model, com, text, camera, behaviors_and_entities};
 use behaviors_and_entities::Entity;
 use model::DrawModel;
 
 const BYTES_PER_PIXEL: u32 = 4;
 const NUM_CAPTURE_BUFFERS: usize = 3;
+
+#[derive(PartialEq)]
+enum BorderAlignment {
+    Free,
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+    FullScreen,
+}
+
+impl BorderAlignment {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "TopLeft" => BorderAlignment::TopLeft,
+            "TopRight" => BorderAlignment::TopRight,
+            "BottomLeft" => BorderAlignment::BottomLeft,
+            "BottomRight" => BorderAlignment::BottomRight,
+            "FullScreen" => BorderAlignment::FullScreen,
+            _ => BorderAlignment::Free,
+        }
+    }
+}
+
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    aspect_ratio: f32,
+    pub camera_controller: camera::CameraController,
+    projection: camera::Projection,
+    camera_uniform: camera::CameraUniform,
+    camera_buffer: wgpu::Buffer,
+    pub camera_bind_group: wgpu::BindGroup,
+    ortho_transform_matrix: cgmath::Matrix4<f32>,
+    ortho_transform_buffer: wgpu::Buffer,
+    pub ortho_matrix_bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    color: cgmath::Vector3<f32>,
+    identity_camera_bind_group: wgpu::BindGroup,
+    alignment: BorderAlignment,
+}
+
+impl Viewport {
+    const NUM_VERTICES: u32 = 8;
+    const BORDER_BUFFER: f32 = 0.1; // the border needs to be drawn slightly inwards; if it is drawn right on the border (eg 0.0), it will be cut off
+    const BACKGROUND_COLOR: cgmath::Vector3<f32> = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
+
+    fn new(
+        x: f32, 
+        y: f32, 
+        w: f32, 
+        h: f32, 
+        camera: camera::Camera, 
+        device: &wgpu::Device, 
+        camera_bind_group_layout: &wgpu::BindGroupLayout, 
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
+        border_color: cgmath::Vector3<f32>, 
+        alignment: BorderAlignment,
+    ) -> Self {
+        // println!("creating projection with aspect {}", w / h);
+        let projection = camera::Projection::new(w, h, cgmath::Deg(45.0), 0.1, 100.0);
+        let mut camera_uniform = camera::CameraUniform::new();
+        camera_uniform.update_view_proj(&camera, &projection);
+        let camera_controller = camera::CameraController::new(8.0, 0.4, camera);
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+            label: Some("Camera Bind Group"),
+        });
+
+        let ortho_transform_matrix: Matrix4<f32> = cgmath::ortho(0.0, w, h, 0.0, -1.0, 1.0);
+        let ortho_transform_arr: [[f32; 4]; 4] = ortho_transform_matrix.into();
+        // for r in ortho_transform_arr {
+        //     for cell in r {
+        //         print!("{} ", cell);
+        //     }
+        //     println!();
+        // }
+
+        let ortho_transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Ortho transform matrix buffer"),
+            contents: bytemuck::cast_slice(&ortho_transform_arr),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let ortho_matrix_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Ortho Matrix Bind Group"),
+            layout: &ortho_matrix_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ortho_transform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let corners = Viewport::get_border_corners(border_color);
+        let border = vec![
+            corners[0],
+            corners[1],
+            corners[1],
+            corners[2],
+            corners[2],
+            corners[3],
+            corners[3],
+            corners[0],
+        ];
+
+        let border_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Border Buffer"),
+            contents: bytemuck::cast_slice(&border),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let identity_camera_bind_group = Viewport::set_camera_binding(&device, &camera_bind_group_layout);
+
+        Viewport {
+            x,
+            y,
+            width: w,
+            height: h,
+            aspect_ratio: w/h,
+            camera_controller,
+            projection,
+            camera_uniform,
+            camera_buffer,
+            camera_bind_group,
+            ortho_transform_matrix,
+            ortho_transform_buffer,
+            ortho_matrix_bind_group,
+            vertex_buffer: border_buffer,
+            color: border_color,
+            identity_camera_bind_group,
+            alignment,
+        }
+    }
+
+    fn load_from_json(
+        json: &serde_json::Value, 
+        device: &wgpu::Device, 
+        camera_bind_group_layout: &wgpu::BindGroupLayout, 
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
+    ) -> Self {
+        Viewport::new(
+            json["x"].as_f64().unwrap() as f32,
+            json["y"].as_f64().unwrap() as f32,
+            json["w"].as_f64().unwrap() as f32,
+            json["h"].as_f64().unwrap() as f32,
+            {
+                let pos_val = json["camera"]["position"].as_array().unwrap();
+                let pos = cgmath::Point3::new(
+                    pos_val[0].as_f64().unwrap() as f32,
+                    pos_val[1].as_f64().unwrap() as f32,
+                    pos_val[2].as_f64().unwrap() as f32,
+                );
+                let rot_val = json["camera"]["rotation"].as_array().unwrap();
+                let s = rot_val[0].as_f64().unwrap() as f32;
+                let v = cgmath::Vector3::new(
+                    rot_val[1].as_f64().unwrap() as f32,
+                    rot_val[2].as_f64().unwrap() as f32,
+                    rot_val[3].as_f64().unwrap() as f32,
+                );
+                let rot: cgmath::Quaternion<f32> = cgmath::Quaternion::<f32>::from_sv(s, v);
+                camera::Camera::new(pos, rot)
+            },
+            device,
+            camera_bind_group_layout,
+            ortho_matrix_bind_group_layout,
+            {
+                let color = json["border color"].as_array().unwrap();
+                cgmath::Vector3::new(
+                    color[0].as_f64().unwrap() as f32,
+                    color[1].as_f64().unwrap() as f32,
+                    color[2].as_f64().unwrap() as f32,
+                )
+            },
+            BorderAlignment::from_str(json["alignment"].as_str().unwrap()),
+        )
+    }
+
+    fn get_border_corners(color: cgmath::Vector3<f32>) -> Vec<model::ModelVertex> {
+        let color_arr = [color.x, color.y, color.z];
+
+        let xmin = Viewport::BORDER_BUFFER;
+        let ymin = Viewport::BORDER_BUFFER;
+        let xmax = 1600.0;
+        let ymax = 1200.0;
+        // println!("{}, {}, {}, {}", xmin, ymin, xmax, ymax);
+
+        let corners = vec![
+            // top left
+            model::ModelVertex { position: [xmin, ymin, 0.0], color: color_arr },
+            // bottom left
+            model::ModelVertex { position: [xmin, ymax, 0.0], color: color_arr },
+            // bottom right
+            model::ModelVertex { position: [xmax, ymax, 0.0], color: color_arr },
+            // top right
+            model::ModelVertex { position: [xmax, ymin, 0.0], color: color_arr },
+        ];
+
+        corners
+    }
+
+    fn set_camera_binding(device: &wgpu::Device, camera_bind_group_layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
+        let identity_camera = camera::CameraUniform::new();
+
+        let identity_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Identity Camera Buffer"),
+            contents: bytemuck::cast_slice(&[identity_camera]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: identity_camera_buffer.as_entire_binding(),
+            }],
+            label: Some("Border Bind Group"),
+        })
+    }
+
+    pub fn resize_from_window(&mut self, screen_width: f32, screen_height: f32, queue: &wgpu::Queue){
+        /*
+        if the width increased, we need to adjust right-aligned borders
+        if the height increased, we need to adjust bottom-aligned borders
+        if the width decreased, we need to make sure 
+
+        when we change the screen dims, the vps should be moved and scaled accordingly
+        right-aligned vps need their x adjusted
+        bottom-aligned vps need their y adjusted
+        screen-sized vp needs its w and h adjusted
+
+         */
+        // println!("resize from window called");
+        // println!("new screen dims: {}, {}", screen_width, screen_height);
+        if self.alignment == BorderAlignment::FullScreen {
+            // println!("resizing full-screen vp to {}, {}, {}, {}", self.x, self.y, screen_width, screen_height);
+            self.width = screen_width;
+            self.height = screen_height;
+        }
+        if self.alignment == BorderAlignment::TopRight || self.alignment == BorderAlignment::BottomRight {
+            // println!("right-aligned border");
+            self.x = screen_width - self.width;
+            // println!("new x = {}", self.x);
+        }
+
+        if self.alignment == BorderAlignment::BottomLeft || self.alignment == BorderAlignment::BottomRight {
+            self.y = screen_height - self.height;
+        }
+
+        self.projection.resize(self.width, self.height);
+
+        let ortho_transform_arr: [[f32; 4]; 4] = self.ortho_transform_matrix.into();
+        queue.write_buffer(
+            &self.ortho_transform_buffer, 
+            0, 
+            bytemuck::cast_slice(&ortho_transform_arr)
+        );
+    }
+
+    pub fn draw_background_and_border<'a>(
+        &'a self,
+        device: &wgpu::Device,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        lines_render_pipeline: &'a wgpu::RenderPipeline,
+        rect_render_pipeline: &'a wgpu::RenderPipeline,
+    ) {
+        render_pass.set_pipeline(rect_render_pipeline);
+        
+        let corners = Viewport::get_border_corners(Viewport::BACKGROUND_COLOR);
+
+        let border = vec![
+            corners[0],
+            corners[1],
+            corners[2],
+            corners[0],
+            corners[2],
+            corners[3],
+        ];
+
+        let bg_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Border Buffer"),
+            contents: bytemuck::cast_slice(&border),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        render_pass.set_vertex_buffer(0, bg_buffer.slice(..));
+        render_pass.set_bind_group(0, &self.identity_camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.ortho_matrix_bind_group, &[]);
+        render_pass.draw(0..6, 0..1);
+
+        render_pass.set_pipeline(lines_render_pipeline);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.draw(0..Viewport::NUM_VERTICES, 0..1);
+    }
+
+    pub fn update_camera(&mut self, dt: std::time::Duration, queue: &wgpu::Queue){
+        self.camera_controller.update_camera(dt);
+        self.camera_uniform.update_view_proj(&self.camera_controller.camera(), &self.projection);
+        // log::info!("{:?}", viewport.camera_uniform);
+    
+        queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
+    }
+}
 
 // Define the scene structure
 pub struct Scene {
@@ -18,6 +339,7 @@ pub struct Scene {
     pub entities: Vec<Entity>,
     pub terrain: model::Terrain,
     pub text_boxes: Vec<text::TextDisplay>,
+    pub viewports: Vec<Viewport>,
     timesteps: Option<usize>,
     data_counter: Option<usize>,
     frame_counter: usize,
@@ -31,6 +353,7 @@ impl Scene {
         timesteps: Option<usize>, 
         data_counter: Option<usize>, 
         terrain: model::Terrain,
+        viewports: Vec<Viewport>,
         device: &wgpu::Device, 
         queue: &wgpu::Queue,
         format: &wgpu::TextureFormat,
@@ -56,6 +379,7 @@ impl Scene {
             entities,
             terrain,
             text_boxes,
+            viewports,
             timesteps,
             data_counter,
             frame_counter,
@@ -169,6 +493,8 @@ impl Scene {
         format: &wgpu::TextureFormat, 
         model_bind_group_layout: &wgpu::BindGroupLayout, 
         text_bind_group_layout: &wgpu::BindGroupLayout,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Self {
@@ -180,6 +506,8 @@ impl Scene {
                 format, 
                 model_bind_group_layout, 
                 text_bind_group_layout, 
+                camera_bind_group_layout,
+                ortho_matrix_bind_group_layout,
                 screen_width, 
                 screen_height, 
             ).unwrap()
@@ -191,6 +519,8 @@ impl Scene {
                 format, 
                 model_bind_group_layout, 
                 text_bind_group_layout, 
+                camera_bind_group_layout,
+                ortho_matrix_bind_group_layout,
                 screen_width, 
                 screen_height, 
             )
@@ -202,6 +532,8 @@ impl Scene {
                 format, 
                 model_bind_group_layout, 
                 text_bind_group_layout, 
+                camera_bind_group_layout,
+                ortho_matrix_bind_group_layout,
                 screen_width, 
                 screen_height, 
             )
@@ -225,6 +557,8 @@ impl Scene {
         format: &wgpu::TextureFormat, 
         model_bind_group_layout: &wgpu::BindGroupLayout, 
         text_bind_group_layout: &wgpu::BindGroupLayout,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> hdf5::Result<Scene> {
@@ -242,6 +576,8 @@ impl Scene {
 
         let terrain = model::Terrain::new(serde_json::Value::Null, &device);
 
+        let viewports = vec![];
+
         let num_entities = entity_vec.len();
         println!("LOADED {} ENTITIES INTO SCENE", num_entities);
 
@@ -255,6 +591,7 @@ impl Scene {
             timesteps,
             data_counter,
             terrain,
+            viewports,
             device,
             queue,
             format,
@@ -283,6 +620,8 @@ impl Scene {
         format: &wgpu::TextureFormat, 
         model_bind_group_layout: &wgpu::BindGroupLayout, 
         text_bind_group_layout: &wgpu::BindGroupLayout,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Scene {
@@ -294,6 +633,8 @@ impl Scene {
             format, 
             model_bind_group_layout, 
             text_bind_group_layout, 
+            camera_bind_group_layout,
+            ortho_matrix_bind_group_layout,
             screen_width, 
             screen_height,
         )
@@ -306,6 +647,8 @@ impl Scene {
         format: &wgpu::TextureFormat, 
         model_bind_group_layout: &wgpu::BindGroupLayout, 
         text_bind_group_layout: &wgpu::BindGroupLayout,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Scene {
@@ -314,6 +657,16 @@ impl Scene {
         let timesteps = timesteps.map(|e| e as usize);
         let data_counter = timesteps.map(|_| 0 as usize);
         let terrain = model::Terrain::new(json["terrain"].take(), device);
+
+        let viewport_temp: Vec<_> = json["viewports"]
+            .as_array()
+            .unwrap()
+            .into_iter()
+            .collect();
+        let mut viewport_vec = Vec::new();
+        for i in viewport_temp.iter() {
+            viewport_vec.push(Viewport::load_from_json(*i, device, camera_bind_group_layout, ortho_matrix_bind_group_layout));
+        }
 
         let entity_temp: Vec<_> = json["entities"]
             .as_array()
@@ -330,6 +683,7 @@ impl Scene {
             timesteps,
             data_counter,
             terrain,
+            viewport_vec,
             device,
             queue,
             format,
@@ -339,71 +693,71 @@ impl Scene {
         )
     }
 
-    pub fn load_scene_from_network(
-        addr: &str, 
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
-        format: &wgpu::TextureFormat, 
-        model_bind_group_layout: &wgpu::BindGroupLayout, 
-        text_bind_group_layout: &wgpu::BindGroupLayout, 
-        screen_width: u32,
-        screen_height: u32,
-    ) -> Result<Scene, Box<dyn std::error::Error>> {
-        // Open port
-        let listener = std::net::TcpListener::bind(addr).unwrap();
-        let mut num_attempt = 0usize;
+    // pub fn load_scene_from_network(
+    //     addr: &str, 
+    //     device: &wgpu::Device, 
+    //     queue: &wgpu::Queue,
+    //     format: &wgpu::TextureFormat, 
+    //     model_bind_group_layout: &wgpu::BindGroupLayout, 
+    //     text_bind_group_layout: &wgpu::BindGroupLayout, 
+    //     screen_width: u32,
+    //     screen_height: u32,
+    // ) -> Result<Scene, Box<dyn std::error::Error>> {
+    //     // Open port
+    //     let listener = std::net::TcpListener::bind(addr).unwrap();
+    //     let mut num_attempt = 0usize;
         
-        // Attempt to recieve initialization packet and parse when successful.
-        let initialization_packet = loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    // debug!("{}", com::from_network(&stream));
-                    break com::from_network(&stream)
-                },
-                _ => {
-                    num_attempt += 1;
-                    debug!("No packet recieved. Trying attempt {}...", num_attempt);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                },
-            }
-        };
-        info!("Received initialization file");
-        let initialization_packet = String::from_utf8(initialization_packet).unwrap();
-        // debug!("Initialization file: {}", initialization_packet);
+    //     // Attempt to recieve initialization packet and parse when successful.
+    //     let initialization_packet = loop {
+    //         match listener.accept() {
+    //             Ok((stream, _)) => {
+    //                 // debug!("{}", com::from_network(&stream));
+    //                 break com::from_network(&stream)
+    //             },
+    //             _ => {
+    //                 num_attempt += 1;
+    //                 debug!("No packet recieved. Trying attempt {}...", num_attempt);
+    //                 std::thread::sleep(std::time::Duration::from_millis(100));
+    //             },
+    //         }
+    //     };
+    //     info!("Received initialization file");
+    //     let initialization_packet = String::from_utf8(initialization_packet).unwrap();
+    //     // debug!("Initialization file: {}", initialization_packet);
 
-        // Receive and save model files
-        for stream in listener.incoming() {
+    //     // Receive and save model files
+    //     for stream in listener.incoming() {
 
-            let mut local_stream = stream.unwrap();
-            match com::from_network_with_protocol(&mut local_stream) {
-                Ok(_) => {},
-                Err("END") => {
-                    debug!("Finished recieving files!");
-                }
-                _ => {break}
-            }
-        }
+    //         let mut local_stream = stream.unwrap();
+    //         match com::from_network_with_protocol(&mut local_stream) {
+    //             Ok(_) => {},
+    //             Err("END") => {
+    //                 debug!("Finished recieving files!");
+    //             }
+    //             _ => {break}
+    //         }
+    //     }
 
-        info!("All files recieved.");
+    //     info!("All files recieved.");
 
-        //
+    //     //
         
-        // Load Scene from initialization packet
+    //     // Load Scene from initialization packet
 
-        Ok(
-            Scene::load_scene_from_json_str(
-                initialization_packet, 
-                device, 
-                queue,
-                format,
-                model_bind_group_layout, 
-                text_bind_group_layout,
-                screen_width, 
-                screen_height,
-            )
-        )
+    //     Ok(
+    //         Scene::load_scene_from_json_str(
+    //             initialization_packet, 
+    //             device, 
+    //             queue,
+    //             format,
+    //             model_bind_group_layout, 
+    //             text_bind_group_layout,
+    //             screen_width, 
+    //             screen_height,
+    //         )
+    //     )
         
-    }
+    // }
 
     pub fn draw<'a>(
         &'a self,

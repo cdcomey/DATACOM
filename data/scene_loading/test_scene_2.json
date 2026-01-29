@@ -4,6 +4,47 @@
         "width": 1000,
         "color": [1.0, 0.0, 0.0]
     },
+    "viewports": [
+        {
+            "x": 0.0,
+            "y": 0.0,
+            "w": 1600.0,
+            "h": 900.0,
+            "camera": 
+            {
+                "position": [0.0, -5.0, 5.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0]
+            },
+            "border color": [0.0, 255.0, 0.0],
+            "alignment": "FullScreen"
+        },
+        {
+            "x": 400.0,
+            "y": 450.0,
+            "w": 400.0,
+            "h": 450.0,
+            "camera": 
+            {
+                "position": [5.0, -10.0, 5.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0]
+            },
+            "border color": [0.0, 0.0, 255.0],
+            "alignment": "BottomRight"
+        },
+        {
+            "x": 1200.0,
+            "y": 0.0,
+            "w": 400.0,
+            "h": 450.0,
+            "camera": 
+            {
+                "position": [-5.0, 0.0, 0.0],
+                "rotation": [1.0, 0.0, 0.0, 0.0]
+            },
+            "border color": [0.0, 0.0, 255.0],
+            "alignment": "BottomRight"
+        }
+    ],
     "timesteps": 0,
     "entities": [
         {   

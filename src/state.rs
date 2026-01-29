@@ -5,8 +5,8 @@ use winit::{
     keyboard::PhysicalKey,
     window::Window,
 };
-use wgpu::{util::DeviceExt, TextureUsages};
-use cgmath::{Deg, Quaternion, Matrix4, Rotation3};
+use wgpu::TextureUsages;
+use cgmath::{Deg, Quaternion, Rotation3};
 
 use crate::model::ModelVertex;
 use crate::scene::Scene;
@@ -15,257 +15,6 @@ use crate::camera;
 use crate::text::GlyphVertex;
 
 use model::{Vertex, DrawModel};
-
-#[derive(PartialEq)]
-enum BorderAlignment {
-    Free,
-    TopLeft,
-    TopRight,
-    BottomRight,
-    BottomLeft,
-    FullScreen,
-}
-
-pub struct Viewport {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    aspect_ratio: f32,
-    pub camera_controller: camera::CameraController,
-    projection: camera::Projection,
-    camera_uniform: camera::CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    ortho_transform_matrix: cgmath::Matrix4<f32>,
-    ortho_transform_buffer: wgpu::Buffer,
-    ortho_matrix_bind_group: wgpu::BindGroup,
-    vertex_buffer: wgpu::Buffer,
-    color: cgmath::Vector3<f32>,
-    identity_camera_bind_group: wgpu::BindGroup,
-    alignment: BorderAlignment,
-}
-
-impl Viewport {
-    const NUM_VERTICES: u32 = 8;
-    const BORDER_BUFFER: f32 = 0.1; // the border needs to be drawn slightly inwards; if it is drawn right on the border (eg 0.0), it will be cut off
-    const BACKGROUND_COLOR: cgmath::Vector3<f32> = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
-
-    fn new(
-        x: f32, 
-        y: f32, 
-        w: f32, 
-        h: f32, 
-        camera: camera::Camera, 
-        device: &wgpu::Device, 
-        camera_bind_group_layout: &wgpu::BindGroupLayout, 
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
-        border_color: cgmath::Vector3<f32>, 
-        alignment: BorderAlignment,
-    ) -> Self {
-        // println!("creating projection with aspect {}", w / h);
-        let projection = camera::Projection::new(w, h, Deg(45.0), 0.1, 100.0);
-        let mut camera_uniform = camera::CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, &projection);
-        let camera_controller = camera::CameraController::new(8.0, 0.4, camera);
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-            label: Some("Camera Bind Group"),
-        });
-
-        let ortho_transform_matrix: Matrix4<f32> = cgmath::ortho(0.0, w, h, 0.0, -1.0, 1.0);
-        let ortho_transform_arr: [[f32; 4]; 4] = ortho_transform_matrix.into();
-        // for r in ortho_transform_arr {
-        //     for cell in r {
-        //         print!("{} ", cell);
-        //     }
-        //     println!();
-        // }
-
-        let ortho_transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Ortho transform matrix buffer"),
-            contents: bytemuck::cast_slice(&ortho_transform_arr),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let ortho_matrix_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Ortho Matrix Bind Group"),
-            layout: &ortho_matrix_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: ortho_transform_buffer.as_entire_binding(),
-            }],
-        });
-
-        let corners = Viewport::get_border_corners(border_color);
-        let border = vec![
-            corners[0],
-            corners[1],
-            corners[1],
-            corners[2],
-            corners[2],
-            corners[3],
-            corners[3],
-            corners[0],
-        ];
-
-        let border_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Border Buffer"),
-            contents: bytemuck::cast_slice(&border),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let identity_camera_bind_group = Viewport::set_camera_binding(&device, &camera_bind_group_layout);
-
-        Viewport {
-            x,
-            y,
-            width: w,
-            height: h,
-            aspect_ratio: w/h,
-            camera_controller,
-            projection,
-            camera_uniform,
-            camera_buffer,
-            camera_bind_group,
-            ortho_transform_matrix,
-            ortho_transform_buffer,
-            ortho_matrix_bind_group,
-            vertex_buffer: border_buffer,
-            color: border_color,
-            identity_camera_bind_group,
-            alignment,
-        }
-    }
-
-    fn get_border_corners(color: cgmath::Vector3<f32>) -> Vec<ModelVertex> {
-        let color_arr = [color.x, color.y, color.z];
-
-        let xmin = Viewport::BORDER_BUFFER;
-        let ymin = Viewport::BORDER_BUFFER;
-        let xmax = 1600.0;
-        let ymax = 1200.0;
-        // println!("{}, {}, {}, {}", xmin, ymin, xmax, ymax);
-
-        let corners = vec![
-            // top left
-            model::ModelVertex { position: [xmin, ymin, 0.0], color: color_arr },
-            // bottom left
-            model::ModelVertex { position: [xmin, ymax, 0.0], color: color_arr },
-            // bottom right
-            model::ModelVertex { position: [xmax, ymax, 0.0], color: color_arr },
-            // top right
-            model::ModelVertex { position: [xmax, ymin, 0.0], color: color_arr },
-        ];
-
-        corners
-    }
-
-    fn set_camera_binding(device: &wgpu::Device, camera_bind_group_layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
-        let identity_camera = camera::CameraUniform::new();
-
-        let identity_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Identity Camera Buffer"),
-            contents: bytemuck::cast_slice(&[identity_camera]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: identity_camera_buffer.as_entire_binding(),
-            }],
-            label: Some("Border Bind Group"),
-        })
-    }
-
-    fn resize_from_window(&mut self, screen_width: f32, screen_height: f32, queue: &wgpu::Queue){
-        /*
-        if the width increased, we need to adjust right-aligned borders
-        if the height increased, we need to adjust bottom-aligned borders
-        if the width decreased, we need to make sure 
-
-        when we change the screen dims, the vps should be moved and scaled accordingly
-        right-aligned vps need their x adjusted
-        bottom-aligned vps need their y adjusted
-        screen-sized vp needs its w and h adjusted
-
-         */
-        // println!("resize from window called");
-        // println!("new screen dims: {}, {}", screen_width, screen_height);
-        if self.alignment == BorderAlignment::FullScreen {
-            // println!("resizing full-screen vp to {}, {}, {}, {}", self.x, self.y, screen_width, screen_height);
-            self.width = screen_width;
-            self.height = screen_height;
-        }
-        if self.alignment == BorderAlignment::TopRight || self.alignment == BorderAlignment::BottomRight {
-            // println!("right-aligned border");
-            self.x = screen_width - self.width;
-            // println!("new x = {}", self.x);
-        }
-
-        if self.alignment == BorderAlignment::BottomLeft || self.alignment == BorderAlignment::BottomRight {
-            self.y = screen_height - self.height;
-        }
-
-        self.projection.resize(self.width, self.height);
-
-        let ortho_transform_arr: [[f32; 4]; 4] = self.ortho_transform_matrix.into();
-        queue.write_buffer(
-            &self.ortho_transform_buffer, 
-            0, 
-            bytemuck::cast_slice(&ortho_transform_arr)
-        );
-    }
-
-    fn draw_background_and_border<'a>(
-        &'a self,
-        device: &wgpu::Device,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        lines_render_pipeline: &'a wgpu::RenderPipeline,
-        rect_render_pipeline: &'a wgpu::RenderPipeline,
-    ) {
-        render_pass.set_pipeline(rect_render_pipeline);
-        
-        let corners = Viewport::get_border_corners(Viewport::BACKGROUND_COLOR);
-
-        let border = vec![
-            corners[0],
-            corners[1],
-            corners[2],
-            corners[0],
-            corners[2],
-            corners[3],
-        ];
-
-        let bg_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Border Buffer"),
-            contents: bytemuck::cast_slice(&border),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        render_pass.set_vertex_buffer(0, bg_buffer.slice(..));
-        render_pass.set_bind_group(0, &self.identity_camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.ortho_matrix_bind_group, &[]);
-        render_pass.draw(0..6, 0..1);
-
-        render_pass.set_pipeline(lines_render_pipeline);
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.draw(0..Viewport::NUM_VERTICES, 0..1);
-    }
-}
 
 pub struct State<'a> {
     surface: wgpu::Surface<'a>,
@@ -280,7 +29,6 @@ pub struct State<'a> {
     text_render_pipeline: wgpu::RenderPipeline,
     terrain_render_pipeline: wgpu::RenderPipeline,
     scene: Scene,
-    pub viewports: Vec<Viewport>,
     window: &'a Window,
     pub framerate: f32,
     pub mouse_pressed: bool,
@@ -476,45 +224,6 @@ impl<'a> State<'a> {
             ]
         });
 
-        let viewports = vec![
-            Viewport::new(
-                0.0, 
-                0.0, 
-                size.width as f32, 
-                size.height as f32, 
-                camera_skew, 
-                &device, 
-                &camera_bind_group_layout, 
-                &ortho_matrix_bind_group_layout,
-                cgmath::Vector3::<f32>::new(0.0, 255.0, 0.0),
-                BorderAlignment::FullScreen,
-            ),
-            Viewport::new(
-                (size.width/4) as f32, 
-                (size.height/2) as f32, 
-                (size.width/4) as f32, 
-                (size.height/2) as f32, 
-                camera_side, 
-                &device, 
-                &camera_bind_group_layout, 
-                &ortho_matrix_bind_group_layout,
-                cgmath::Vector3::<f32>::new(0.0, 0.0, 255.0),
-                BorderAlignment::BottomRight,
-            ),
-            Viewport::new(
-                (size.width*3/4) as f32, 
-                0.0, 
-                (size.width/4) as f32, 
-                (size.height/2) as f32, 
-                camera_front, 
-                &device, 
-                &camera_bind_group_layout, 
-                &ortho_matrix_bind_group_layout,
-                cgmath::Vector3::<f32>::new(0.0, 0.0, 255.0),
-                BorderAlignment::TopRight,
-            ),
-        ];
-
         let model_bind_group_layout = 
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
@@ -559,6 +268,8 @@ impl<'a> State<'a> {
             &config.format, 
             &model_bind_group_layout, 
             &text_bind_group_layout, 
+            &camera_bind_group_layout, 
+            &ortho_matrix_bind_group_layout, 
             size.width, 
             size.height,
         );
@@ -687,7 +398,6 @@ impl<'a> State<'a> {
             text_render_pipeline,
             terrain_render_pipeline,
             scene,
-            viewports,
             window,
             framerate: 60.0,
             mouse_pressed: false,
@@ -700,7 +410,7 @@ impl<'a> State<'a> {
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            for viewport in &mut self.viewports {
+            for viewport in &mut self.scene.viewports {
                 viewport.resize_from_window(
                     new_size.width as f32, 
                     new_size.height as f32, 
@@ -724,9 +434,9 @@ impl<'a> State<'a> {
                         ..
                     },
                 ..
-            } => self.viewports[0].camera_controller.process_keyboard(*key, *state, &self.scene.entities),
+            } => self.scene.viewports[0].camera_controller.process_keyboard(*key, *state, &self.scene.entities),
             WindowEvent::MouseWheel { delta, .. } => {
-                self.viewports[0].camera_controller.process_scroll(delta);
+                self.scene.viewports[0].camera_controller.process_scroll(delta);
                 true
             }
             WindowEvent::MouseInput {
@@ -734,6 +444,7 @@ impl<'a> State<'a> {
                 state,
                 ..
             } => {
+                println!("mouse press detected in state.rs");
                 self.mouse_pressed = *state == ElementState::Pressed;
                 true
             }
@@ -750,17 +461,10 @@ impl<'a> State<'a> {
     }
 
     pub fn update(&mut self, dt: std::time::Duration, should_save_to_file: bool) {
-        for viewport in &mut self.viewports {
-            viewport.camera_controller.update_camera(dt);
-            viewport.camera_uniform.update_view_proj(&viewport.camera_controller.camera(), &viewport.projection);
-            // log::info!("{:?}", viewport.camera_uniform);
-        
-            self.queue.write_buffer(
-                &viewport.camera_buffer,
-                0,
-                bytemuck::cast_slice(&[viewport.camera_uniform]),
-            );
+        for viewport in &mut self.scene.viewports {
+            viewport.update_camera(dt, &self.queue);
         }
+
         self.framerate = dt.as_secs_f32().recip();
         let fr_str = format!("{:.1} fps", self.framerate);
         self.scene.text_boxes[0].change_text(&self.device, fr_str);
@@ -819,7 +523,7 @@ impl<'a> State<'a> {
                 timestamp_writes: None,
             });
 
-            for viewport in self.viewports.iter() {
+            for viewport in self.scene.viewports.iter() {
                 // println!("viewport dims: {}, {}, {}, {}", viewport.x, viewport.y, viewport.width, viewport.height);
                 render_pass.set_viewport(viewport.x, viewport.y, viewport.width, viewport.height, 0.0, 1.0);
 
