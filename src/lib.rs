@@ -239,8 +239,8 @@ pub async fn run_scene_from_network(args: Vec<String>){
     let (tx_listener, rx_listener): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
 
     let port_string = "data/ports.toml".to_string();
-    let server_test_result = com::create_server_thread(port_string.clone());
-    let server_test = server_test_result.unwrap();
+    // let server_test_result = com::create_server_thread(port_string.clone());
+    // let server_test = server_test_result.unwrap();
 
     let stream = com::connect_to_tcp_stream(port_string);
     let listener_result = com::create_listener_thread(tx_listener, stream.try_clone().unwrap());
