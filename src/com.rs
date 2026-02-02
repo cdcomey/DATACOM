@@ -395,6 +395,7 @@ pub fn create_server_thread(file: String) -> Result<thread::JoinHandle<()>, std:
 
     let handle = thread::Builder::new().name("server thread".to_string()).spawn(move|| {
         info!("Opened server thread");
+        thread::sleep(Duration::from_secs(7));
         let ports = get_ports(file.as_str()).unwrap();
         let addrs_iter = &(ports[..]);
         debug!("got addr");
@@ -466,14 +467,20 @@ fn connect_to_ip_addr(addrs: &[SocketAddr], timeout: Duration) -> std::io::Resul
 pub fn connect_to_tcp_stream(file: String) -> TcpStream {
     let ports = get_ports(file.as_str()).unwrap();
     let addrs_iter = &(ports[..]);
-    let timeout = Duration::from_secs(2);
+    let port_connect_timeout = Duration::from_millis(100);
     // let mut addrs_iter = "localhost:8081".to_socket_addrs().unwrap();
     // let addr = addrs_iter.next().unwrap();
     // thread::sleep(Duration::from_secs(1));
 
-    // let start_time = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
+    let mut stream_result = None;
 
-    let stream_result = connect_to_ip_addr(addrs_iter, timeout);
+    while !has_timed_out(start_time) {
+        if let Ok(s) = connect_to_ip_addr(addrs_iter, port_connect_timeout) {
+            stream_result = Some(s);
+            break;
+        }
+    }
     stream_result.unwrap()
 }
 
