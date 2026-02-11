@@ -15,7 +15,7 @@ DATACOM is a general-purpose 3D visualization engine built with Rust and OpenGL,
 ## Prerequisites
 
 - Rust (latest stable version)
-- OpenGL 3.3+ compatible graphics hardware
+- WebGPU-compatible graphics hardware
 
 ## Installation
 
@@ -35,6 +35,17 @@ Before running DATACOM, configure the server endpoints in `data/ports.toml`:
 ```
 
 ## Running the Client
+To run a JSON scene with a simple set of behaviors:
+```bash
+cargo run -- scene.json
+```
+
+To run an HDF5 scene:
+```bash
+cargo run -- scene.hdf5
+```
+
+To receive and display a scene through data streaming:
 ```bash
 cargo run
 ```
@@ -45,11 +56,7 @@ DATACOM uses a custom binary protocol over TCP for efficient data transfer. All 
 
 ### Connection Handshake
 
-1. **Server**: Creates `TcpListener` using `std::net::TcpListener::bind()`
-2. **Server**: Accepts incoming connections via `tcp_listener.incoming()`
-3. **Client**: Creates listener thread
-4. **Client**: Sends `"ACK"` as bytes through stream
-5. **Server**: Reads ACK and begins data transmission
+Upon running, the client will check each available IP address and port until a server awaiting on one is found. The client will then send "ACK" as bytes.
 
 ### Initial File Transfer
 
