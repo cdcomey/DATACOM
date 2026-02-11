@@ -112,6 +112,48 @@ Signals completion of initial file transfer phase:
 The scene JSON file defines the initial 3D environment and entities. Example structure:
 ```json
 {
+  "viewports": [
+    {
+      "x": 0.0,
+      "y": 0.0,
+      "w": 1600.0,
+      "h": 1200.0,
+      "camera": 
+      {
+        "position": [0.0, -5.0, 5.0],
+        "rotation": [0.85355335, -0.3535534, 0.14644663, -0.3535534]
+      },
+        "border color": [0.0, 255.0, 0.0],
+        "alignment": "FullScreen"
+    },
+    {
+      "x": 1200.0,
+      "y": 450.0,
+      "w": 400.0,
+      "h": 600.0,
+      "camera": 
+      {
+        "position": [2.7, -5.0, 0.0],
+        "rotation": [1.0, 0.0, 0.0, 0.0]
+      },
+        "border color": [0.0, 0.0, 255.0],
+        "alignment": "BottomRight"
+    },
+    {
+      "x": 1200.0,
+      "y": 0.0,
+      "w": 400.0,
+      "h": 600.0,
+      "camera": 
+      {
+        "position": [-5.0, 0.0, 0.0],
+        "rotation": [0.70710677, 0.0, 0.0, -0.70710677]
+      },
+        "border color": [0.0, 0.0, 255.0],
+        "alignment": "TopRight"
+    },
+    ...
+  ],
   "terrain": {
     "z_pos": 0.0,           // Optional: terrain height
     "width": 1000,          // Optional: terrain dimensions
