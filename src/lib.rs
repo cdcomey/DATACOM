@@ -17,6 +17,7 @@ mod model;
 mod camera;
 mod com;
 mod text;
+mod server_test;
 
 
 pub async fn run_scene_from_json(args: Vec<String>) {
@@ -241,7 +242,7 @@ pub async fn run_scene_from_network(args: Vec<String>){
     let port_string = "data/ports.toml".to_string();
 
     if args.len() >= 3 && args[1] == "test" {
-        let server_test_result = com::create_server_thread(
+        let server_test_result = server_test::create_server_thread(
             port_string.clone(),
             args[2].clone(),
             args[3].clone(),
