@@ -4,7 +4,7 @@ use std::fmt;
 // use tokio::time::sleep;
 use std::net::{ToSocketAddrs, TcpStream, IpAddr, TcpListener, SocketAddr};
 // use std::error::Error;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, Receiver};
 use std::thread;
 use std::fs::{self, File, OpenOptions};
 use std::time::Duration;
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use toml::Value;
 use log::{debug, info};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MESSAGE_TYPE_BYTE_WIDTH: usize = 2;
 const FILE_ID_BYTE_WIDTH: usize = 8;
@@ -37,6 +37,7 @@ const CHECKSUM_WIDTH: usize = 4;
 const SECONDS_UNTIL_TIMEOUT: u64 = 10;
 const TIMEOUT_THRESHOLD: Duration = Duration::from_secs(SECONDS_UNTIL_TIMEOUT);
 const MAX_CHUNK_TRANSMIT_ATTEMPTS: u8 = 5;
+static FILE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[repr(u16)]
 #[derive(Debug)]
@@ -195,8 +196,8 @@ fn has_timed_out(start_time: std::time::Instant) -> bool {
     start_time.elapsed() >= TIMEOUT_THRESHOLD
 }
 
-fn send_finite_test_data(mut stream: TcpStream){
-    let path = std::path::Path::new("data/scene_loading/test_scene_2.json");
+fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
+    let path = std::path::Path::new(path_str);
     let test_command_data_main = fs::read_to_string(path).unwrap();
     let data_len = test_command_data_main.len();
 
@@ -279,7 +280,7 @@ fn send_finite_test_data(mut stream: TcpStream){
     stream.flush().unwrap();
 }
 
-fn send_streamed_test_data(mut stream: TcpStream){
+fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     let message_type = 0u16;
     let file_id = 1212121212u64;
     let file_name_base = "data/scene_loading/entity_pos.bin";
@@ -313,7 +314,7 @@ fn send_streamed_test_data(mut stream: TcpStream){
     // stream.flush().unwrap();
     
     
-    let path: &Path = std::path::Path::new("data/scene_loading/obj.bin");
+    let path: &Path = std::path::Path::new(path_str);
     let mut file = File::open(path).unwrap();
     let metadata = fs::metadata(path).unwrap();
     let file_len = metadata.len();
@@ -381,21 +382,13 @@ fn send_streamed_test_data(mut stream: TcpStream){
     // }
 }
 
-pub fn create_server_thread(file: String) -> Result<thread::JoinHandle<()>, std::io::Error>{
-    /*
-    get ports
-    get addr
-    listener = TcpListener::bind(addr)
-    for stream in listener.incoming()
-        stream.read_exact(ack)
-        loop {
-            stream.write_all(file_data)
-        }
-     */
-
+pub fn create_server_thread(
+    file: String,
+    json_file_path: String,
+    bin_file_path: String,
+) -> Result<thread::JoinHandle<()>, std::io::Error>{
     let handle = thread::Builder::new().name("server thread".to_string()).spawn(move|| {
         info!("Opened server thread");
-        thread::sleep(Duration::from_secs(7));
         let ports = get_ports(file.as_str()).unwrap();
         let addrs_iter = &(ports[..]);
         debug!("got addr");
@@ -415,12 +408,10 @@ pub fn create_server_thread(file: String) -> Result<thread::JoinHandle<()>, std:
                     stream.read_exact(&mut ack).unwrap();
                     if &ack == b"ACK" {
                         info!("server thread received ACK");
-
-                        // there was originally a loop here
                         let stream_clone = stream.try_clone();
-                        send_finite_test_data(stream);
+                        send_finite_test_data(stream, &json_file_path);
                         thread::sleep(Duration::from_secs(3));
-                        send_streamed_test_data(stream_clone.unwrap());
+                        send_streamed_test_data(stream_clone.unwrap(), &bin_file_path);
                     }
                     
                 },
