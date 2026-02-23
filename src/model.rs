@@ -1,6 +1,8 @@
 use serde_derive::Deserialize;
 use wgpu::util::DeviceExt;
 use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
+use crate::camera;
+use log::debug;
 
 pub trait Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static>;
@@ -403,6 +405,214 @@ impl Terrain {
             index_buffer,
             num_indices,
         }
+    }
+}
+
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    color: cgmath::Vector3<f32>,
+    vertex_buffer: wgpu::Buffer,
+    identity_camera_bind_group: wgpu::BindGroup,
+}
+
+impl Rect {
+    const NUM_VERTICES: u32 = 8;
+    const BORDER_BUFFER: f32 = 0.1;
+    const BACKGROUND_COLOR: cgmath::Vector3<f32> = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
+
+    pub fn new(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: cgmath::Vector3<f32>,
+        device: &wgpu::Device,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let corners = Rect::get_border_corners(x, y, w, h, color);
+        let border = vec![
+            corners[0],
+            corners[1],
+            corners[1],
+            corners[2],
+            corners[2],
+            corners[3],
+            corners[3],
+            corners[0],
+        ];
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Border Buffer"),
+            contents: bytemuck::cast_slice(&border),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let identity_camera_bind_group = Rect::set_camera_binding(device, camera_bind_group_layout);
+
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+            color,
+            vertex_buffer,
+            identity_camera_bind_group,
+        }
+    }
+
+    fn get_border_corners(x: f32, y: f32, w: f32, h: f32, color: cgmath::Vector3<f32>) -> Vec<ModelVertex> {
+        let color_arr = [color.x, color.y, color.z];
+
+        let xmin = x + Rect::BORDER_BUFFER;
+        let ymin = y + Rect::BORDER_BUFFER;
+        let xmax = x + w;
+        let ymax = y + h;
+
+        vec![
+            ModelVertex { position: [xmin, ymin, 0.0], color: color_arr },
+            ModelVertex { position: [xmin, ymax, 0.0], color: color_arr },
+            ModelVertex { position: [xmax, ymax, 0.0], color: color_arr },
+            ModelVertex { position: [xmax, ymin, 0.0], color: color_arr },
+        ]
+    }
+
+    fn set_camera_binding(device: &wgpu::Device, camera_bind_group_layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
+        let identity_camera = camera::CameraUniform::new();
+
+        let identity_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Identity Camera Buffer"),
+            contents: bytemuck::cast_slice(&[identity_camera]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: identity_camera_buffer.as_entire_binding(),
+            }],
+            label: Some("Border Bind Group"),
+        })
+    }
+
+    pub fn draw_background_and_border<'a>(
+        &'a self,
+        device: &wgpu::Device,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        lines_render_pipeline: &'a wgpu::RenderPipeline,
+        rect_render_pipeline: &'a wgpu::RenderPipeline,
+        ortho_matrix_bind_group: &'a wgpu::BindGroup,
+    ) {
+        render_pass.set_pipeline(rect_render_pipeline);
+
+        let corners = Rect::get_border_corners(self.x, self.y, self.width, self.height, Rect::BACKGROUND_COLOR);
+        let bg = vec![
+            corners[0],
+            corners[1],
+            corners[2],
+            corners[0],
+            corners[2],
+            corners[3],
+        ];
+
+        let bg_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Border Buffer"),
+            contents: bytemuck::cast_slice(&bg),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        render_pass.set_vertex_buffer(0, bg_buffer.slice(..));
+        render_pass.set_bind_group(0, &self.identity_camera_bind_group, &[]);
+        render_pass.set_bind_group(1, ortho_matrix_bind_group, &[]);
+        render_pass.draw(0..6, 0..1);
+
+        render_pass.set_pipeline(lines_render_pipeline);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.draw(0..Rect::NUM_VERTICES, 0..1);
+    }
+}
+
+pub struct ProgressBar {
+    outline_rect: Rect,
+    fill_rect: Rect,
+    max_timesteps: usize,
+    pub current_transform: cgmath::Matrix4<f32>,
+}
+
+impl ProgressBar {
+    pub fn new(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        outline_color: cgmath::Vector3<f32>,
+        fill_color: cgmath::Vector3<f32>,
+        device: &wgpu::Device,
+        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        max_timesteps: usize,
+    ) -> Self {
+        ProgressBar {
+            outline_rect: Rect::new(x, y, width, height, outline_color, device, camera_bind_group_layout),
+            fill_rect: Rect::new(x, y, width, height, fill_color, device, camera_bind_group_layout),
+            max_timesteps,
+            current_transform: cgmath::Matrix4::from_nonuniform_scale(0.0, 1.0, 1.0),
+        }
+    }
+
+    pub fn get_transform_matrix(&self, current_timestep: usize) -> cgmath::Matrix4<f32> {
+        let scale = current_timestep as f32 / self.max_timesteps as f32;
+        cgmath::Matrix4::from_nonuniform_scale(scale, 1.0, 1.0)
+    }
+
+    pub fn draw<'a>(
+        &'a self,
+        device: &wgpu::Device,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        lines_render_pipeline: &'a wgpu::RenderPipeline,
+        rect_render_pipeline: &'a wgpu::RenderPipeline,
+        ortho_matrix_bind_group: &'a wgpu::BindGroup,
+    ) {
+        // debug!("drawing progress bar at ({}, {})", self.outline_rect.x, self.outline_rect.y);
+        // Draw static outline over the full bar extent
+        render_pass.set_pipeline(lines_render_pipeline);
+        render_pass.set_vertex_buffer(0, self.outline_rect.vertex_buffer.slice(..));
+        render_pass.set_bind_group(0, &self.outline_rect.identity_camera_bind_group, &[]);
+        render_pass.set_bind_group(1, ortho_matrix_bind_group, &[]);
+        render_pass.draw(0..Rect::NUM_VERTICES, 0..1);
+
+        // Extract x-scale from the pre-computed transform (column 0, row 0)
+        let scale = self.current_transform[0][0];
+        let fill_width = self.fill_rect.width * scale;
+        let color_arr = [self.fill_rect.color.x, self.fill_rect.color.y, self.fill_rect.color.z];
+
+        let x  = self.fill_rect.x;
+        let y  = self.fill_rect.y;
+        let x2 = x + fill_width;
+        let y2 = y + self.fill_rect.height;
+
+        let fill_vertices = vec![
+            ModelVertex { position: [x,  y,  0.0], color: color_arr },
+            ModelVertex { position: [x,  y2, 0.0], color: color_arr },
+            ModelVertex { position: [x2, y2, 0.0], color: color_arr },
+            ModelVertex { position: [x,  y,  0.0], color: color_arr },
+            ModelVertex { position: [x2, y2, 0.0], color: color_arr },
+            ModelVertex { position: [x2, y,  0.0], color: color_arr },
+        ];
+
+        let fill_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Progress Fill Buffer"),
+            contents: bytemuck::cast_slice(&fill_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        render_pass.set_pipeline(rect_render_pipeline);
+        render_pass.set_vertex_buffer(0, fill_buffer.slice(..));
+        render_pass.set_bind_group(0, &self.fill_rect.identity_camera_bind_group, &[]);
+        render_pass.set_bind_group(1, ortho_matrix_bind_group, &[]);
+        render_pass.draw(0..6, 0..1);
     }
 }
 

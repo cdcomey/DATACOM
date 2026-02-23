@@ -1,4 +1,5 @@
 use std::iter;
+use std::sync::Arc;
 
 use winit::{
     event::*,
@@ -19,8 +20,8 @@ use model::{Vertex, DrawModel};
 pub struct State<'a> {
     surface: wgpu::Surface<'a>,
     offscreen_texture: wgpu::Texture,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
@@ -136,6 +137,8 @@ impl<'a> State<'a> {
             )
             .await
             .unwrap();
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
         assert!(device.features().contains(wgpu::Features::POLYGON_MODE_LINE), "Wireframe polygon mode not supported!");
 
         log::warn!("Surface");
@@ -174,24 +177,6 @@ impl<'a> State<'a> {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-
-        // front-facing camera
-        let camera_yaw = Quaternion::from_angle_z(Deg(-90.0));
-        let camera_roll = Quaternion::from_angle_y(Deg(0.0));
-        let camera_pitch = Quaternion::from_angle_x(Deg(0.0));
-        let camera_rotation = camera_yaw * camera_roll * camera_pitch;
-        let camera_front = camera::Camera::new((-5.0, 0.0, 0.0), camera_rotation);
-
-        // side-facing camera
-        let camera_yaw = Quaternion::from_angle_z(Deg(0.0));
-        let camera_rotation = camera_yaw * camera_roll * camera_pitch;
-        let camera_side = camera::Camera::new((5.0, -10.0, 0.0), camera_rotation);
-
-        // skewed camera
-        let camera_yaw = Quaternion::from_angle_z(Deg(-45.0));
-        let camera_pitch = Quaternion::from_angle_x(Deg(-45.0));
-        let camera_rotation = camera_yaw * camera_roll * camera_pitch;
-        let camera_skew = camera::Camera::new((0.0, -5.0, 5.0), camera_rotation);
 
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -261,19 +246,6 @@ impl<'a> State<'a> {
             label: Some("Text Bind Group Layout"),
         });
 
-        let scene = Scene::load_scene(
-            filepath, 
-            &device, 
-            &queue, 
-            &config.format, 
-            &model_bind_group_layout, 
-            &text_bind_group_layout, 
-            &camera_bind_group_layout, 
-            &ortho_matrix_bind_group_layout, 
-            size.width, 
-            size.height,
-        );
-
         let render_pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
@@ -301,6 +273,19 @@ impl<'a> State<'a> {
             ],
             push_constant_ranges: &[],
         });
+
+        let scene = Scene::load_scene(
+            filepath,
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            &config.format,
+            model_bind_group_layout,
+            &text_bind_group_layout,
+            camera_bind_group_layout,
+            &ortho_matrix_bind_group_layout,
+            size.width,
+            size.height,
+        );
 
         let render_pipeline = {
             let shader = wgpu::ShaderModuleDescriptor {
@@ -539,7 +524,7 @@ impl<'a> State<'a> {
 
             for viewport in self.scene.viewports.iter() {
                 // println!("viewport dims: {}, {}, {}, {}", viewport.x, viewport.y, viewport.width, viewport.height);
-                render_pass.set_viewport(viewport.x, viewport.y, viewport.width, viewport.height, 0.0, 1.0);
+                render_pass.set_viewport(viewport.rect.x, viewport.rect.y, viewport.rect.width, viewport.rect.height, 0.0, 1.0);
 
                 viewport.draw_background_and_border(
                     &self.device, 
@@ -551,13 +536,15 @@ impl<'a> State<'a> {
                 render_pass.draw_axes(&self.scene.axes, &viewport.camera_bind_group);
 
                 self.scene.draw(
-                    &mut render_pass, 
-                    &viewport.camera_bind_group, 
-                    &viewport.ortho_matrix_bind_group, 
-                    &self.render_pipeline, 
-                    &self.text_render_pipeline, 
-                    &self.terrain_render_pipeline, 
-                    &self.queue, 
+                    &mut render_pass,
+                    &viewport.camera_bind_group,
+                    &viewport.ortho_matrix_bind_group,
+                    &self.render_pipeline,
+                    &self.lines_render_pipeline,
+                    &self.rect_render_pipeline,
+                    &self.text_render_pipeline,
+                    &self.terrain_render_pipeline,
+                    &self.queue,
                 );
             }
         }

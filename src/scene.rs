@@ -4,8 +4,9 @@ use log::{debug, info};
 use std::process::{Command, Stdio};
 use std::io::Write;
 use std::sync::Arc;
-use cgmath::Matrix4;
-use wgpu::util::DeviceExt;
+use std::rc::Rc;
+use cgmath::{Matrix4, Vector3};
+use wgpu::{Device, Queue, BindGroupLayout, util::DeviceExt};
 
 use crate::{model, com, text, camera, behaviors_and_entities};
 use behaviors_and_entities::Entity;
@@ -38,10 +39,7 @@ impl BorderAlignment {
 }
 
 pub struct Viewport {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+    pub rect: model::Rect,
     aspect_ratio: f32,
     pub camera_controller: camera::CameraController,
     projection: camera::Projection,
@@ -51,30 +49,22 @@ pub struct Viewport {
     ortho_transform_matrix: cgmath::Matrix4<f32>,
     ortho_transform_buffer: wgpu::Buffer,
     pub ortho_matrix_bind_group: wgpu::BindGroup,
-    vertex_buffer: wgpu::Buffer,
-    color: cgmath::Vector3<f32>,
-    identity_camera_bind_group: wgpu::BindGroup,
     alignment: BorderAlignment,
 }
 
 impl Viewport {
-    const NUM_VERTICES: u32 = 8;
-    const BORDER_BUFFER: f32 = 0.1; // the border needs to be drawn slightly inwards; if it is drawn right on the border (eg 0.0), it will be cut off
-    const BACKGROUND_COLOR: cgmath::Vector3<f32> = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
-
     fn new(
-        x: f32, 
-        y: f32, 
-        w: f32, 
-        h: f32, 
-        camera: camera::Camera, 
-        device: &wgpu::Device, 
-        camera_bind_group_layout: &wgpu::BindGroupLayout, 
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
-        border_color: cgmath::Vector3<f32>, 
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        camera: camera::Camera,
+        device: &Device,
+        camera_bind_group_layout: &BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
+        border_color: cgmath::Vector3<f32>,
         alignment: BorderAlignment,
     ) -> Self {
-        // println!("creating projection with aspect {}", w / h);
         let projection = camera::Projection::new(w, h, cgmath::Deg(45.0), 0.1, 100.0);
         let mut camera_uniform = camera::CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
@@ -97,12 +87,6 @@ impl Viewport {
 
         let ortho_transform_matrix: Matrix4<f32> = cgmath::ortho(0.0, w, h, 0.0, -1.0, 1.0);
         let ortho_transform_arr: [[f32; 4]; 4] = ortho_transform_matrix.into();
-        // for r in ortho_transform_arr {
-        //     for cell in r {
-        //         print!("{} ", cell);
-        //     }
-        //     println!();
-        // }
 
         let ortho_transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ortho transform matrix buffer"),
@@ -119,32 +103,11 @@ impl Viewport {
             }],
         });
 
-        let corners = Viewport::get_border_corners(border_color);
-        let border = vec![
-            corners[0],
-            corners[1],
-            corners[1],
-            corners[2],
-            corners[2],
-            corners[3],
-            corners[3],
-            corners[0],
-        ];
-
-        let border_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Border Buffer"),
-            contents: bytemuck::cast_slice(&border),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let identity_camera_bind_group = Viewport::set_camera_binding(&device, &camera_bind_group_layout);
+        let rect = model::Rect::new(x, y, w, h, border_color, device, camera_bind_group_layout);
 
         Viewport {
-            x,
-            y,
-            width: w,
-            height: h,
-            aspect_ratio: w/h,
+            rect,
+            aspect_ratio: w / h,
             camera_controller,
             projection,
             camera_uniform,
@@ -153,17 +116,14 @@ impl Viewport {
             ortho_transform_matrix,
             ortho_transform_buffer,
             ortho_matrix_bind_group,
-            vertex_buffer: border_buffer,
-            color: border_color,
-            identity_camera_bind_group,
             alignment,
         }
     }
 
     fn default(
-        device: &wgpu::Device, 
-        camera_bind_group_layout: &wgpu::BindGroupLayout, 
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
+        device: &Device, 
+        camera_bind_group_layout: &BindGroupLayout, 
+        ortho_matrix_bind_group_layout: &BindGroupLayout, 
     ) -> Self {
         use cgmath::{Deg, Quaternion, Rotation3};
         let camera_yaw = Quaternion::from_angle_z(Deg(-45.0));
@@ -188,9 +148,9 @@ impl Viewport {
 
     fn load_from_json(
         json: &serde_json::Value, 
-        device: &wgpu::Device, 
-        camera_bind_group_layout: &wgpu::BindGroupLayout, 
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout, 
+        device: &Device, 
+        camera_bind_group_layout: &BindGroupLayout, 
+        ortho_matrix_bind_group_layout: &BindGroupLayout, 
     ) -> Self {
         Viewport::new(
             json["x"].as_f64().unwrap() as f32,
@@ -229,49 +189,7 @@ impl Viewport {
         )
     }
 
-    fn get_border_corners(color: cgmath::Vector3<f32>) -> Vec<model::ModelVertex> {
-        let color_arr = [color.x, color.y, color.z];
-
-        let xmin = Viewport::BORDER_BUFFER;
-        let ymin = Viewport::BORDER_BUFFER;
-        let xmax = 1600.0;
-        let ymax = 1200.0;
-        // println!("{}, {}, {}, {}", xmin, ymin, xmax, ymax);
-
-        let corners = vec![
-            // top left
-            model::ModelVertex { position: [xmin, ymin, 0.0], color: color_arr },
-            // bottom left
-            model::ModelVertex { position: [xmin, ymax, 0.0], color: color_arr },
-            // bottom right
-            model::ModelVertex { position: [xmax, ymax, 0.0], color: color_arr },
-            // top right
-            model::ModelVertex { position: [xmax, ymin, 0.0], color: color_arr },
-        ];
-
-        corners
-    }
-
-    fn set_camera_binding(device: &wgpu::Device, camera_bind_group_layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
-        let identity_camera = camera::CameraUniform::new();
-
-        let identity_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Identity Camera Buffer"),
-            contents: bytemuck::cast_slice(&[identity_camera]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: identity_camera_buffer.as_entire_binding(),
-            }],
-            label: Some("Border Bind Group"),
-        })
-    }
-
-    pub fn resize_from_window(&mut self, screen_width: f32, screen_height: f32, queue: &wgpu::Queue){
+    pub fn resize_from_window(&mut self, screen_width: f32, screen_height: f32, queue: &Queue){
         /*
         if the width increased, we need to adjust right-aligned borders
         if the height increased, we need to adjust bottom-aligned borders
@@ -286,21 +204,18 @@ impl Viewport {
         // println!("resize from window called");
         // println!("new screen dims: {}, {}", screen_width, screen_height);
         if self.alignment == BorderAlignment::FullScreen {
-            // println!("resizing full-screen vp to {}, {}, {}, {}", self.x, self.y, screen_width, screen_height);
-            self.width = screen_width;
-            self.height = screen_height;
+            self.rect.width = screen_width;
+            self.rect.height = screen_height;
         }
         if self.alignment == BorderAlignment::TopRight || self.alignment == BorderAlignment::BottomRight {
-            // println!("right-aligned border");
-            self.x = screen_width - self.width;
-            // println!("new x = {}", self.x);
+            self.rect.x = screen_width - self.rect.width;
         }
 
         if self.alignment == BorderAlignment::BottomLeft || self.alignment == BorderAlignment::BottomRight {
-            self.y = screen_height - self.height;
+            self.rect.y = screen_height - self.rect.height;
         }
 
-        self.projection.resize(self.width, self.height);
+        self.projection.resize(self.rect.width, self.rect.height);
 
         let ortho_transform_arr: [[f32; 4]; 4] = self.ortho_transform_matrix.into();
         queue.write_buffer(
@@ -312,44 +227,24 @@ impl Viewport {
 
     pub fn draw_background_and_border<'a>(
         &'a self,
-        device: &wgpu::Device,
+        device: &Device,
         render_pass: &mut wgpu::RenderPass<'a>,
         lines_render_pipeline: &'a wgpu::RenderPipeline,
         rect_render_pipeline: &'a wgpu::RenderPipeline,
     ) {
-        render_pass.set_pipeline(rect_render_pipeline);
-        
-        let corners = Viewport::get_border_corners(Viewport::BACKGROUND_COLOR);
-
-        let border = vec![
-            corners[0],
-            corners[1],
-            corners[2],
-            corners[0],
-            corners[2],
-            corners[3],
-        ];
-
-        let bg_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Border Buffer"),
-            contents: bytemuck::cast_slice(&border),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        render_pass.set_vertex_buffer(0, bg_buffer.slice(..));
-        render_pass.set_bind_group(0, &self.identity_camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.ortho_matrix_bind_group, &[]);
-        render_pass.draw(0..6, 0..1);
-
-        render_pass.set_pipeline(lines_render_pipeline);
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.draw(0..Viewport::NUM_VERTICES, 0..1);
+        self.rect.draw_background_and_border(
+            device,
+            render_pass,
+            lines_render_pipeline,
+            rect_render_pipeline,
+            &self.ortho_matrix_bind_group,
+        );
     }
 
     pub fn update_camera(
         &mut self, 
         dt: std::time::Duration, 
-        queue: &wgpu::Queue
+        queue: &Queue
     ){
         self.camera_controller.update_camera(dt);
         self.camera_uniform.update_view_proj(&self.camera_controller.camera(), &self.projection);
@@ -370,7 +265,13 @@ pub struct Scene {
     pub terrain: model::Terrain,
     pub text_boxes: Vec<text::TextDisplay>,
     pub viewports: Vec<Viewport>,
-    timesteps: Option<usize>,
+    pub device: std::sync::Arc<Device>,
+    pub queue: std::sync::Arc<Queue>,
+    pub model_bind_group_layout: BindGroupLayout,
+    pub camera_bind_group_layout: BindGroupLayout,
+    elapsed_timesteps: usize,
+    total_timesteps: Option<usize>,
+    progress_bar: Option<model::ProgressBar>,
     data_counter: Option<usize>,
     frame_counter: usize,
     capture_buffers: Vec<wgpu::Buffer>,
@@ -379,24 +280,27 @@ pub struct Scene {
 
 impl Scene {
     pub fn new(
-        entities: Vec<Entity>, 
-        timesteps: Option<usize>, 
-        data_counter: Option<usize>, 
+        entities: Vec<Entity>,
+        total_timesteps: Option<usize>,
+        progress_bar: Option<model::ProgressBar>,
+        data_counter: Option<usize>,
         terrain: model::Terrain,
         viewports: Vec<Viewport>,
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
+        device: std::sync::Arc<Device>,
+        queue: std::sync::Arc<Queue>,
         format: &wgpu::TextureFormat,
-        text_bind_group_layout: &wgpu::BindGroupLayout,
+        model_bind_group_layout: BindGroupLayout,
+        camera_bind_group_layout: BindGroupLayout,
+        text_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Self {
-        let axes = model::Axes::new(device);
-        let text_boxes = Scene::init_text_boxes(device, queue, format, text_bind_group_layout, 60.0);
+        let axes = model::Axes::new(&device);
+        let text_boxes = Scene::init_text_boxes(&device, &queue, format, text_bind_group_layout, 60.0);
         let frame_counter: usize = 0;
         let capture_buffers = Scene::init_capture_buffers(
-            device, 
-            NUM_CAPTURE_BUFFERS, 
+            &device,
+            NUM_CAPTURE_BUFFERS,
             (Into::<u64>::into(BYTES_PER_PIXEL) * ((screen_width * screen_height) as u64)) as wgpu::BufferAddress
         );
 
@@ -410,7 +314,13 @@ impl Scene {
             terrain,
             text_boxes,
             viewports,
-            timesteps,
+            device,
+            queue,
+            model_bind_group_layout,
+            camera_bind_group_layout,
+            elapsed_timesteps: 0,
+            total_timesteps,
+            progress_bar,
             data_counter,
             frame_counter,
             capture_buffers,
@@ -419,10 +329,10 @@ impl Scene {
     }
 
     fn init_text_boxes(
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
+        device: &Device, 
+        queue: &Queue,
         format: &wgpu::TextureFormat,
-        text_bind_group_layout: &wgpu::BindGroupLayout, 
+        text_bind_group_layout: &BindGroupLayout, 
         framerate: f32,
     ) -> Vec<TextDisplay> {
         let (image_atlas, glyph_map) = text::load_font_atlas(&text::get_font(), 100.0);
@@ -464,11 +374,17 @@ impl Scene {
         for entity in &mut self.entities {
             entity.run_behaviors(self.data_counter);
         }
-        
+
         if let Some(c) = self.data_counter {
             // self.data_counter = Some(c + DATA_ARR_WIDTH * AVERAGE_REFRESH_RATE);
             self.data_counter = Some(c + behaviors_and_entities::DATA_ARR_WIDTH);
             debug!("data counter is now {}", self.data_counter.unwrap());
+        }
+
+        self.elapsed_timesteps += 1;
+
+        if let Some(pb) = &mut self.progress_bar {
+            pb.current_transform = pb.get_transform_matrix(self.elapsed_timesteps);
         }
     }
 
@@ -517,78 +433,55 @@ impl Scene {
     // }
 
     pub fn load_scene(
-        filepath: &str, 
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
-        format: &wgpu::TextureFormat, 
-        model_bind_group_layout: &wgpu::BindGroupLayout, 
-        text_bind_group_layout: &wgpu::BindGroupLayout,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
+        filepath: &str,
+        device: std::sync::Arc<Device>,
+        queue: std::sync::Arc<Queue>,
+        format: &wgpu::TextureFormat,
+        model_bind_group_layout: BindGroupLayout,
+        text_bind_group_layout: &BindGroupLayout,
+        camera_bind_group_layout: BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Self {
-        if filepath.ends_with(".hdf5"){
+        if filepath.ends_with(".hdf5") {
             Scene::load_scene_from_hdf5(
-                filepath, 
-                device, 
-                queue, 
-                format, 
-                model_bind_group_layout, 
-                text_bind_group_layout, 
+                filepath,
+                device,
+                queue,
+                format,
+                model_bind_group_layout,
+                text_bind_group_layout,
                 camera_bind_group_layout,
                 ortho_matrix_bind_group_layout,
-                screen_width, 
-                screen_height, 
+                screen_width,
+                screen_height,
             ).unwrap()
-        } else if filepath.ends_with(".json"){
-            Scene::load_scene_from_json(
-                filepath, 
-                device, 
-                queue, 
-                format, 
-                model_bind_group_layout, 
-                text_bind_group_layout, 
-                camera_bind_group_layout,
-                ortho_matrix_bind_group_layout,
-                screen_width, 
-                screen_height, 
-            )
         } else {
             Scene::load_scene_from_json(
-                filepath, 
-                device, 
-                queue, 
-                format, 
-                model_bind_group_layout, 
-                text_bind_group_layout, 
+                filepath,
+                device,
+                queue,
+                format,
+                model_bind_group_layout,
+                text_bind_group_layout,
                 camera_bind_group_layout,
                 ortho_matrix_bind_group_layout,
-                screen_width, 
-                screen_height, 
+                screen_width,
+                screen_height,
             )
-            // Scene::load_scene_from_network(
-            //     filepath, 
-            //     device, 
-            //     queue, 
-            //     format, 
-            //     model_bind_group_layout, 
-            //     text_bind_group_layout, 
-            //     screen_width, 
-            //     screen_height, 
-            // ).unwrap()
         }
     }
 
     fn load_scene_from_hdf5(
-        filepath: &str, 
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
-        format: &wgpu::TextureFormat, 
-        model_bind_group_layout: &wgpu::BindGroupLayout, 
-        text_bind_group_layout: &wgpu::BindGroupLayout,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
+        filepath: &str,
+        device: std::sync::Arc<Device>,
+        queue: std::sync::Arc<Queue>,
+        format: &wgpu::TextureFormat,
+        model_bind_group_layout: BindGroupLayout,
+        text_bind_group_layout: &BindGroupLayout,
+        camera_bind_group_layout: BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> hdf5::Result<Scene> {
@@ -600,49 +493,57 @@ impl Scene {
             let name_full = vehicle.name();
             let name = name_full["/Vehicles/".len()..].to_string();
             let data = vehicle.dataset("states").unwrap();
-            let entity = Entity::load_from_hdf5(name, data, device, model_bind_group_layout).unwrap();
+            let entity = Entity::load_from_hdf5(name, data, &device, &model_bind_group_layout).unwrap();
             entity_vec.push(entity);
         }
 
         let terrain = model::Terrain::new(serde_json::Value::Null, &device);
-        // let terrain = model::Terrain::load_from_hdf5();
 
         let viewports = vec![
             Viewport::default(
-                device,
-                camera_bind_group_layout,
-                ortho_matrix_bind_group_layout
+                &device,
+                &camera_bind_group_layout,
+                ortho_matrix_bind_group_layout,
             )
         ];
 
         let num_entities = entity_vec.len();
         println!("LOADED {} ENTITIES INTO SCENE", num_entities);
 
-        // set timesteps
-        let timesteps = Scene::find_timesteps(&entity_vec);
-        let data_counter = timesteps.map(|_| 0 as usize);
-
+        let total_timesteps = Scene::find_timesteps(&entity_vec);
+        let data_counter = total_timesteps.map(|_| 0 as usize);
+        let progress_bar = total_timesteps.map(|n| model::ProgressBar::new(
+            100.0, 985.0, 1400.0, 30.0,
+            Vector3::new(1.0, 1.0, 1.0),  // white outline
+            Vector3::new(1.0, 0.0, 1.0),  // magenta fill
+            &device,
+            &camera_bind_group_layout,
+            n,
+        ));
 
         Ok(Scene::new(
             entity_vec,
-            timesteps,
+            total_timesteps,
+            progress_bar,
             data_counter,
             terrain,
             viewports,
             device,
             queue,
             format,
+            model_bind_group_layout,
+            camera_bind_group_layout,
             text_bind_group_layout,
-            screen_width, 
+            screen_width,
             screen_height,
         ))
     }
 
-    fn find_timesteps(entity_vec: &Vec<Entity>) -> Option<usize>{
+    fn find_timesteps(entity_vec: &Vec<Entity>) -> Option<usize> {
         for entity in entity_vec.iter() {
-            let timesteps = entity.find_timesteps();
-            if let Some(_) = timesteps {
-                return timesteps;
+            let total_timesteps = entity.find_timesteps();
+            if let Some(_) = total_timesteps {
+                return total_timesteps;
             }
         }
 
@@ -651,49 +552,49 @@ impl Scene {
     }
 
     fn load_scene_from_json(
-        filepath: &str, 
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
-        format: &wgpu::TextureFormat, 
-        model_bind_group_layout: &wgpu::BindGroupLayout, 
-        text_bind_group_layout: &wgpu::BindGroupLayout,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
+        filepath: &str,
+        device: std::sync::Arc<Device>,
+        queue: std::sync::Arc<Queue>,
+        format: &wgpu::TextureFormat,
+        model_bind_group_layout: BindGroupLayout,
+        text_bind_group_layout: &BindGroupLayout,
+        camera_bind_group_layout: BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Scene {
         let json_unparsed = std::fs::read_to_string(filepath).unwrap();
         Scene::load_scene_from_json_str(
-            json_unparsed, 
-            device, 
-            queue, 
-            format, 
-            model_bind_group_layout, 
-            text_bind_group_layout, 
+            json_unparsed,
+            device,
+            queue,
+            format,
+            model_bind_group_layout,
+            text_bind_group_layout,
             camera_bind_group_layout,
             ortho_matrix_bind_group_layout,
-            screen_width, 
+            screen_width,
             screen_height,
         )
     }
 
     fn load_scene_from_json_str(
-        json_unparsed: String, 
-        device: &wgpu::Device, 
-        queue: &wgpu::Queue,
-        format: &wgpu::TextureFormat, 
-        model_bind_group_layout: &wgpu::BindGroupLayout, 
-        text_bind_group_layout: &wgpu::BindGroupLayout,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
-        ortho_matrix_bind_group_layout: &wgpu::BindGroupLayout,
+        json_unparsed: String,
+        device: std::sync::Arc<Device>,
+        queue: std::sync::Arc<Queue>,
+        format: &wgpu::TextureFormat,
+        model_bind_group_layout: BindGroupLayout,
+        text_bind_group_layout: &BindGroupLayout,
+        camera_bind_group_layout: BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
     ) -> Scene {
         let mut json: serde_json::Value = serde_json::from_str(&json_unparsed).unwrap();
-        let timesteps = json["timesteps"].as_u64();
-        let timesteps = timesteps.map(|e| e as usize);
-        let data_counter = timesteps.map(|_| 0 as usize);
-        let terrain = model::Terrain::new(json["terrain"].take(), device);
+        let total_timesteps = json["total_timesteps"].as_u64();
+        let total_timesteps = total_timesteps.map(|e| e as usize);
+        let data_counter = total_timesteps.map(|_| 0 as usize);
+        let terrain = model::Terrain::new(json["terrain"].take(), &device);
 
         let viewport_temp: Vec<_> = json["viewports"]
             .as_array()
@@ -702,7 +603,7 @@ impl Scene {
             .collect();
         let mut viewport_vec = Vec::new();
         for i in viewport_temp.iter() {
-            viewport_vec.push(Viewport::load_from_json(*i, device, camera_bind_group_layout, ortho_matrix_bind_group_layout));
+            viewport_vec.push(Viewport::load_from_json(*i, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout));
         }
 
         let entity_temp: Vec<_> = json["entities"]
@@ -712,31 +613,34 @@ impl Scene {
             .collect();
         let mut entity_vec = vec![];
         for i in entity_temp.iter() {
-            entity_vec.push(Entity::load_from_json(*i, device, model_bind_group_layout));
+            entity_vec.push(Entity::load_from_json(*i, &device, &model_bind_group_layout));
         }
 
         Scene::new(
             entity_vec,
-            timesteps,
+            total_timesteps,
+            None,
             data_counter,
             terrain,
             viewport_vec,
             device,
             queue,
             format,
+            model_bind_group_layout,
+            camera_bind_group_layout,
             text_bind_group_layout,
-            screen_width, 
+            screen_width,
             screen_height,
         )
     }
 
     // pub fn load_scene_from_network(
     //     addr: &str, 
-    //     device: &wgpu::Device, 
-    //     queue: &wgpu::Queue,
+    //     device: &Device, 
+    //     queue: &Queue,
     //     format: &wgpu::TextureFormat, 
-    //     model_bind_group_layout: &wgpu::BindGroupLayout, 
-    //     text_bind_group_layout: &wgpu::BindGroupLayout, 
+    //     model_bind_group_layout: &BindGroupLayout, 
+    //     text_bind_group_layout: &BindGroupLayout, 
     //     screen_width: u32,
     //     screen_height: u32,
     // ) -> Result<Scene, Box<dyn std::error::Error>> {
@@ -802,9 +706,11 @@ impl Scene {
         camera_bind_group: &'a wgpu::BindGroup,
         ortho_matrix_bind_group: &'a wgpu::BindGroup,
         model_render_pipeline: &'a wgpu::RenderPipeline,
+        lines_render_pipeline: &'a wgpu::RenderPipeline,
+        rect_render_pipeline: &'a wgpu::RenderPipeline,
         text_render_pipeline: &'a wgpu::RenderPipeline,
         terrain_render_pipeline: &'a wgpu::RenderPipeline,
-        queue: &wgpu::Queue,
+        queue: &Queue,
     ){
         render_pass.set_pipeline(terrain_render_pipeline);
         render_pass.draw_terrain(&self.terrain, camera_bind_group);
@@ -814,15 +720,17 @@ impl Scene {
             entity.draw(render_pass, camera_bind_group, queue);
         }
 
-        // println!("preparing to draw text");
         render_pass.set_pipeline(text_render_pipeline);
         for text_box in self.text_boxes.iter() {
-            // println!("drawing text");
             text_box.draw(ortho_matrix_bind_group, render_pass);
+        }
+
+        if let Some(pb) = &self.progress_bar {
+            pb.draw(&self.device, render_pass, lines_render_pipeline, rect_render_pipeline, ortho_matrix_bind_group);
         }
     }
 
-    fn init_capture_buffers(device: &wgpu::Device, num_buffers: usize, size: wgpu::BufferAddress) -> Vec<wgpu::Buffer> {
+    fn init_capture_buffers(device: &Device, num_buffers: usize, size: wgpu::BufferAddress) -> Vec<wgpu::Buffer> {
         let buffers: Vec<wgpu::Buffer> = (0..num_buffers)
             .map(|_| {
                 device.create_buffer(&wgpu::BufferDescriptor {
@@ -837,7 +745,7 @@ impl Scene {
         buffers
     }
 
-    pub fn read_and_write_capture_buffers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, offscreen_texture: &wgpu::Texture, width: u32, height: u32){
+    pub fn read_and_write_capture_buffers(&mut self, device: &Device, queue: &Queue, offscreen_texture: &wgpu::Texture, width: u32, height: u32){
             let index = self.frame_counter % NUM_CAPTURE_BUFFERS;
             // read buf n
             if self.frame_counter > NUM_CAPTURE_BUFFERS {
@@ -864,7 +772,7 @@ impl Scene {
 
             self.increment_frame_counter();
             
-            if self.data_counter > self.timesteps {
+            if self.data_counter > self.total_timesteps {
                 println!("sim finished; time to save");
                 self.read_remaining_buffers(device, width, height);
                 println!("{} total frames recorded", self.screen_recordings.len());
@@ -875,7 +783,7 @@ impl Scene {
 
     }
     
-    fn write_screen_to_capture_buf(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, capture_buffers: &mut Vec<wgpu::Buffer>, width: u32, height: u32, index: usize){
+    fn write_screen_to_capture_buf(device: &Device, queue: &Queue, texture: &wgpu::Texture, capture_buffers: &mut Vec<wgpu::Buffer>, width: u32, height: u32, index: usize){
         let padded_bytes_per_row = ((width * BYTES_PER_PIXEL + 255) / 256) * 256;
 
         let capture_buf = &capture_buffers[index];
@@ -912,7 +820,7 @@ impl Scene {
         queue.submit(Some(encoder.finish()));
     }
 
-    fn read_capture_buf(device: &wgpu::Device, capture_buffers: &Vec<wgpu::Buffer>, width: u32, height: u32, index: usize) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    fn read_capture_buf(device: &Device, capture_buffers: &Vec<wgpu::Buffer>, width: u32, height: u32, index: usize) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
         let padded_bytes_per_row = ((width * BYTES_PER_PIXEL + 255) / 256) * 256;
         let mut output = Vec::new();
 
@@ -939,7 +847,7 @@ impl Scene {
         Ok(output)
     }
 
-    fn read_remaining_buffers(&mut self, device: &wgpu::Device, width: u32, height: u32){
+    fn read_remaining_buffers(&mut self, device: &Device, width: u32, height: u32){
         for i in 0..NUM_CAPTURE_BUFFERS {
             let index = (self.frame_counter + i) % NUM_CAPTURE_BUFFERS;
             let mut saved_frame = Scene::read_capture_buf(device, &self.capture_buffers, width, height, index).expect("problem with reading final few buffers");
