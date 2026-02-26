@@ -535,6 +535,37 @@ impl Rect {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(default)]
+struct ProgressBarConfig {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    outline_color: [f32; 3],
+    fill_color: [f32; 3],
+}
+
+fn default_progress_bar_x() -> f32 { 100.0 }
+fn default_progress_bar_y() -> f32 { 985.0 }
+fn default_progress_bar_width() -> f32 { 1400.0 }
+fn default_progress_bar_height() -> f32 { 30.0 }
+fn default_progress_bar_outline_color() -> [f32; 3] { [1.0, 1.0, 1.0] }
+fn default_progress_bar_fill_color() -> [f32; 3] { [1.0, 0.0, 1.0] }
+
+impl Default for ProgressBarConfig {
+    fn default() -> Self {
+        ProgressBarConfig {
+            x: default_progress_bar_x(),
+            y: default_progress_bar_y(),
+            width: default_progress_bar_width(),
+            height: default_progress_bar_height(),
+            outline_color: default_progress_bar_outline_color(),
+            fill_color: default_progress_bar_fill_color(),
+        }
+    }
+}
+
 pub struct ProgressBar {
     outline_rect: Rect,
     fill_rect: Rect,
@@ -544,19 +575,18 @@ pub struct ProgressBar {
 
 impl ProgressBar {
     pub fn new(
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        outline_color: cgmath::Vector3<f32>,
-        fill_color: cgmath::Vector3<f32>,
+        json: serde_json::Value,
         device: &wgpu::Device,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
         max_timesteps: usize,
     ) -> Self {
+        let config: ProgressBarConfig = serde_json::from_value(json).unwrap_or_default();
+        let outline_color = cgmath::Vector3::new(config.outline_color[0], config.outline_color[1], config.outline_color[2]);
+        let fill_color = cgmath::Vector3::new(config.fill_color[0], config.fill_color[1], config.fill_color[2]);
+
         ProgressBar {
-            outline_rect: Rect::new(x, y, width, height, outline_color, device, camera_bind_group_layout),
-            fill_rect: Rect::new(x, y, width, height, fill_color, device, camera_bind_group_layout),
+            outline_rect: Rect::new(config.x, config.y, config.width, config.height, outline_color, device, camera_bind_group_layout),
+            fill_rect: Rect::new(config.x, config.y, config.width, config.height, fill_color, device, camera_bind_group_layout),
             max_timesteps,
             current_transform: cgmath::Matrix4::from_nonuniform_scale(0.0, 1.0, 1.0),
         }

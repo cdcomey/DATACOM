@@ -513,9 +513,7 @@ impl Scene {
         let total_timesteps = Scene::find_timesteps(&entity_vec);
         let data_counter = total_timesteps.map(|_| 0 as usize);
         let progress_bar = total_timesteps.map(|n| model::ProgressBar::new(
-            100.0, 985.0, 1400.0, 30.0,
-            Vector3::new(1.0, 1.0, 1.0),  // white outline
-            Vector3::new(1.0, 0.0, 1.0),  // magenta fill
+            serde_json::Value::Null,
             &device,
             &camera_bind_group_layout,
             n,
