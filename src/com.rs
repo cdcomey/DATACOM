@@ -13,9 +13,10 @@ use std::path::Path;
 use toml::Value;
 use log::{debug, info};
 use std::sync::atomic::{AtomicU64, Ordering};
+use uuid::Uuid;
 
 const MESSAGE_TYPE_BYTE_WIDTH: usize = 2;
-const FILE_ID_BYTE_WIDTH: usize = 8;
+const FILE_ID_BYTE_WIDTH: usize = 16;
 const FILE_NAME_LENGTH_BYTE_WIDTH: usize = 1;
 // TODO: only public for test file; change later
 pub const MAX_FILE_NAME_BYTE_WIDTH: usize = u8::max_value() as usize;
@@ -67,7 +68,7 @@ impl MessageType {
 #[derive(Debug)]
 pub struct FileInfo {
     message_type: MessageType,
-    id: u64,
+    id: Uuid,
     name_length: u8,
     name: [u8; MAX_FILE_NAME_BYTE_WIDTH],
     is_definite: bool,
@@ -87,7 +88,7 @@ impl FileInfo {
         counter += MESSAGE_TYPE_BYTE_WIDTH;
 
         let id_bytes: [u8; FILE_ID_BYTE_WIDTH] = buf[counter..counter+FILE_ID_BYTE_WIDTH].try_into().unwrap();
-        let id = u64::from_be_bytes(id_bytes);
+        let id = Uuid::from_bytes(id_bytes);
         counter += FILE_ID_BYTE_WIDTH;
 
         let name_length_bytes: [u8; FILE_NAME_LENGTH_BYTE_WIDTH] = buf[counter..counter+FILE_NAME_LENGTH_BYTE_WIDTH].try_into().unwrap();
@@ -351,7 +352,7 @@ fn receive_file_chunk(
     rx: &Receiver<Vec<u8>>, 
     buf: &mut Vec<u8>, 
     start_time: std::time::Instant, 
-    active_files: &mut HashMap<u64, FileInfo>
+    active_files: &mut HashMap<Uuid, FileInfo>
 ) -> Option<Vec<u8>> {
     while buf.len() < CHUNK_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
         let Ok(msg) = rx.try_recv() else {
@@ -376,7 +377,7 @@ fn receive_file_chunk(
         .unwrap();
     debug!("L: parsed chunk metadata");
 
-    let file_id = u64::from_be_bytes(file_id_bytes);
+    let file_id = Uuid::from_bytes(file_id_bytes);
     let chunk_offset = u64::from_be_bytes(chunk_offset_bytes);
     let chunk_offset_us = chunk_offset as usize;
     let chunk_length = u32::from_be_bytes(chunk_length_bytes) as usize;
@@ -446,7 +447,7 @@ fn receive_file_chunk(
     None
 }
 
-fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant, active_files: &mut HashMap<u64, FileInfo>){
+fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant, active_files: &mut HashMap<Uuid, FileInfo>){
     while buf.len() < FILE_END_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
         let Ok(msg) = rx.try_recv() else {
             return
@@ -458,7 +459,7 @@ fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: 
     let file_id_bytes: [u8; FILE_ID_BYTE_WIDTH] = buf[MESSAGE_TYPE_BYTE_WIDTH..MESSAGE_TYPE_BYTE_WIDTH+FILE_ID_BYTE_WIDTH]
         .try_into()
         .unwrap();
-    let file_id = u64::from_be_bytes(file_id_bytes);
+    let file_id = Uuid::from_bytes(file_id_bytes);
     let file_data = active_files.remove(&file_id).unwrap();
     let name = file_data.name();
     append_to_file(name, file_data.data.to_vec());
@@ -471,15 +472,17 @@ fn finish_receiving_transmission(buf: &mut Vec<u8>){
 
 fn append_to_file(file_name: String, data: Vec<u8>){
     let path = Path::new(&file_name);
-    let metadata = fs::metadata(path).unwrap();
-    let file_len = metadata.len();
-    debug!("file length before adding chunk: {file_len}");
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)
         .unwrap();
+
     // let file_contents = String::from_utf8(data).unwrap();
+    let metadata = fs::metadata(path).unwrap();
+    let file_len = metadata.len();
+    debug!("file length before adding chunk: {file_len}");
+
     file.write_all(&data).unwrap();
     let metadata = fs::metadata(path).unwrap();
     let file_len = metadata.len();
@@ -490,7 +493,7 @@ fn append_to_file(file_name: String, data: Vec<u8>){
 pub fn receive_file(
     rx_main: &Receiver<Vec<u8>>, 
     tx_sender: &Sender<Vec<u8>>,
-    active_files: &mut HashMap<u64, FileInfo>, 
+    active_files: &mut HashMap<Uuid, FileInfo>, 
     buf: &mut Vec<u8>
 ) -> bool {
     // debug!("Preparing to receive file");
@@ -566,7 +569,7 @@ pub fn receive_file(
         },
     };
 
-    info!("L: finished processing message");
+    // info!("L: finished processing message");
     transmission_over
 }
 

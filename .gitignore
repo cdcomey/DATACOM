@@ -7,3 +7,5 @@
 tmp.py
 data/scene_loading/entity_pos.bin
 data/scene_loading/main_scene.json
+.DS_Store
+Cargo.lock

@@ -5,10 +5,9 @@ use winit::{
 };
 use std::sync::mpsc;
 use std::collections::HashMap;
+use uuid::Uuid;
 use log::{info, debug};
-use std::fs::{File, remove_file};
-use std::path::Path;
-use std::io::Write;
+use std::fs::remove_file;
 
 mod behaviors_and_entities;
 mod scene;
@@ -254,10 +253,10 @@ pub async fn run_scene_from_network(args: Vec<String>){
     let listener_result = com::create_listener_thread(tx_listener, stream.try_clone().unwrap());
     let listener = listener_result.unwrap();
 
-    let sender_result = com::create_sender_thread(rx_sender, stream);
+    let _sender_result = com::create_sender_thread(rx_sender, stream);
 
     // files that the receiver is getting data about and writing to
-    let mut active_files: HashMap<u64, com::FileInfo> = HashMap::new();
+    let mut active_files: HashMap<Uuid, com::FileInfo> = HashMap::new();
     let mut buf: Vec<u8> = Vec::new();
     
     // initial file transfer
