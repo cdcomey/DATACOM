@@ -191,26 +191,25 @@ pub struct Entity {
 impl Entity {
     pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Entity {
         let name = json["Name"].to_string();
+        debug!("loading entity {name}");
 
         // Position
-        let position_temp = json["Position"]
+        let position_temp: Vec<f32> = json["Position"]
             .as_array()
             .unwrap()
-            .into_iter();
-        let mut position_vec = Point3::<f32>::new(0.0, 0.0, 0.0);
-        for (i, position) in position_temp.enumerate() {
-            position_vec[i] = position.as_f64().unwrap() as f32;
-        }
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let position = Point3::new(position_temp[0], position_temp[1], position_temp[2]);
 
         // Rotation
-        let rotation_temp = json["Rotation"]
+        let rotation_arr: Vec<f32> = json["Rotation"]
             .as_array()
             .unwrap()
-            .into_iter();
-        let mut rotation_vec = Vector3::<f32>::new(0.0, 0.0, 0.0);
-        for (i, rotation_comp) in rotation_temp.enumerate() {
-            rotation_vec[i] = rotation_comp.as_f64().unwrap() as f32;
-        }
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let rotation = Quaternion::new(rotation_arr[0], rotation_arr[1], rotation_arr[2], rotation_arr[3]);
 
         // Scale
         let scale_temp = json["Scale"]
@@ -248,8 +247,8 @@ impl Entity {
 
         Entity {
             name: name,
-            position: Rc::new(RefCell::new(position_vec)),
-            rotation: Quaternion::from_sv(1.0, rotation_vec),
+            position: Rc::new(RefCell::new(position)),
+            rotation,
             scale: scale_vec,
             models: model_vec,
             behaviors: behavior_vec,

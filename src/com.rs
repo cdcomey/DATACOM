@@ -471,7 +471,16 @@ fn finish_receiving_transmission(buf: &mut Vec<u8>){
 }
 
 fn append_to_file(file_name: String, data: Vec<u8>){
-    let path = Path::new(&file_name);
+    let dir = if file_name.ends_with(".obj") {
+        "data/object_loading"
+    } else if file_name.ends_with(".json") {
+        "data/scene_loading"
+    } else {
+        "."
+    };
+    let full_path = format!("{}/{}", dir, file_name);
+    debug!("appending file {full_path}");
+    let path = Path::new(&full_path);
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)

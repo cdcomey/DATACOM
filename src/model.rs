@@ -50,6 +50,7 @@ pub fn load_mesh(
     device: &wgpu::Device,
     color: cgmath::Vector3<f32>,
 ) -> anyhow::Result<Mesh> {
+    debug!("Attempting to load mesh from {file_name}");
     let (models, _) = tobj::load_obj(
         file_name,
         &tobj::LoadOptions {
@@ -175,27 +176,30 @@ impl Model {
 
     pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Model {
         let name = json["Name"].as_str().unwrap();
-        let filepath = json["ObjectFilePath"].as_str().unwrap();
+        let filepath_raw = json["ObjectFilePath"].as_str().unwrap();
+        let filepath_owned;
+        let filepath = if filepath_raw.ends_with(".obj") {
+            filepath_owned = format!("data/object_loading/{}", filepath_raw);
+            filepath_owned.as_str()
+        } else {
+            filepath_raw
+        };
 
-        let mut position_vec = cgmath::Point3::<f32>::new(0.0, 0.0, 0.0);
-        let position_temp: Vec<_> = json["Position"]
+        let position_arr: Vec<f32> = json["Position"]
             .as_array()
             .unwrap()
-            .into_iter()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
             .collect();
-        for (i, position) in position_temp.iter().enumerate() {
-            position_vec[i] = position.as_f64().unwrap() as f32;
-        }
+        let position_vec = cgmath::Point3::<f32>::new(position_arr[0], position_arr[1], position_arr[2]);
 
-        let rotation_temp: Vec<_> = json["Rotation"]
+        let rotation_arr: Vec<f32> = json["Rotation"]
             .as_array()
             .unwrap()
-            .into_iter()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
             .collect();
-        let mut rotation_vec = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
-        for (i, rotation_comp) in rotation_temp.iter().enumerate() {
-            rotation_vec[i] = rotation_comp.as_f64().unwrap() as f32;
-        }
+        let rotation_vec = cgmath::Quaternion::new(rotation_arr[0], rotation_arr[1], rotation_arr[2], rotation_arr[3]);
 
         let color_temp: Vec<_> = json["Color"]
             .as_array()
@@ -217,7 +221,7 @@ impl Model {
             filepath,
             device,
             position_vec,
-            cgmath::Quaternion::from_sv(1.0, rotation_vec),
+            rotation_vec,
             color_vec,
             model_bind_group_layout,
         )
