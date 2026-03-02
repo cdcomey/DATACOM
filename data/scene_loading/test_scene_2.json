@@ -4,6 +4,14 @@
         "width": 1000,
         "color": [1.0, 0.0, 0.0]
     },
+    "progress_bar": {
+        "x": 100,
+        "y": 1100,
+        "width": 1400,
+        "height": 30,
+        "outline_color": [1.0, 1.0, 1.0],
+        "fill_color": [1.0, 0.0, 1.0]
+    },
     "viewports": [
         {
             "x": 0.0,
@@ -15,7 +23,7 @@
                 "position": [0.0, -5.0, 5.0],
                 "rotation": [1.0, 0.0, 0.0, 0.0]
             },
-            "border color": [0.0, 255.0, 0.0],
+            "border color": [0.0, 1.0, 0.0],
             "alignment": "FullScreen"
         },
         {
@@ -28,7 +36,7 @@
                 "position": [5.0, -10.0, 5.0],
                 "rotation": [1.0, 0.0, 0.0, 0.0]
             },
-            "border color": [0.0, 0.0, 255.0],
+            "border color": [0.0, 0.0, 1.0],
             "alignment": "BottomRight"
         },
         {
@@ -41,7 +49,7 @@
                 "position": [-5.0, 0.0, 0.0],
                 "rotation": [1.0, 0.0, 0.0, 0.0]
             },
-            "border color": [0.0, 0.0, 255.0],
+            "border color": [0.0, 0.0, 1.0],
             "alignment": "TopRight"
         }
     ],
