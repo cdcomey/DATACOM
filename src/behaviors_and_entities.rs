@@ -226,7 +226,9 @@ impl Entity {
                 let model_temp: Vec<_> = array.into_iter().collect();
                 let mut model_vec = vec![];
                 for i in model_temp.iter() {
-                    model_vec.push(model::Model::load_from_json(*i, device, model_bind_group_layout));
+                    if let Some(m) = model::Model::load_from_json(*i, device, model_bind_group_layout) {
+                        model_vec.push(m);
+                    }
                 }
                 model_vec
             }
