@@ -166,7 +166,9 @@ impl Model {
                 let model_temp: Vec<_> = array.into_iter().collect();
                 let mut model_vec = vec![];
                 for i in model_temp.iter() {
-                    model_vec.push(Model::load_from_json(*i, device, model_bind_group_layout));
+                    if let Some(m) = Model::load_from_json(*i, device, model_bind_group_layout) {
+                        model_vec.push(m);
+                    }
                 }
                 model_vec
             }
@@ -174,9 +176,12 @@ impl Model {
         }
     }
 
-    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Model {
+    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Option<Model> {
         let name = json["Name"].as_str().unwrap();
         let filepath_raw = json["ObjectFilePath"].as_str().unwrap();
+        if filepath_raw.is_empty() {
+            return None;
+        }
         let filepath_owned;
         let filepath = if filepath_raw.ends_with(".obj") {
             filepath_owned = format!("data/object_loading/{}", filepath_raw);
@@ -216,7 +221,7 @@ impl Model {
         // debug!("ROTATION: {}", rotation_vec);
         // debug!("COLOR: {}", color_vec);
 
-        Model::new(
+        Some(Model::new(
             name,
             filepath,
             device,
@@ -224,7 +229,7 @@ impl Model {
             rotation_vec,
             color_vec,
             model_bind_group_layout,
-        )
+        ))
     }
 
     pub fn to_matrix(&self) -> cgmath::Matrix4<f32> {
