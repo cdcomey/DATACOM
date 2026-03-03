@@ -470,6 +470,34 @@ fn finish_receiving_transmission(buf: &mut Vec<u8>){
     buf.drain(0..MESSAGE_TYPE_BYTE_WIDTH);
 }
 
+fn json_pretty(value: &serde_json::Value, depth: usize) -> String {
+    let pad = "  ".repeat(depth);
+    let inner_pad = "  ".repeat(depth + 1);
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.is_empty() { return "{}".to_string(); }
+            let entries: Vec<String> = map.iter()
+                .map(|(k, v)| format!("{}{}: {}", inner_pad, serde_json::to_string(k).unwrap(), json_pretty(v, depth + 1)))
+                .collect();
+            format!("{{\n{}\n{}}}", entries.join(",\n"), pad)
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() { return "[]".to_string(); }
+            let all_primitive = arr.iter().all(|v| !v.is_array() && !v.is_object());
+            if all_primitive && arr.len() <= 4 {
+                let items: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                format!("[{}]", items.join(", "))
+            } else {
+                let items: Vec<String> = arr.iter()
+                    .map(|v| format!("{}{}", inner_pad, json_pretty(v, depth + 1)))
+                    .collect();
+                format!("[\n{}\n{}]", items.join(",\n"), pad)
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
 fn append_to_file(file_name: String, data: Vec<u8>){
     let dir = if file_name.ends_with(".obj") {
         "data/object_loading"
@@ -492,7 +520,15 @@ fn append_to_file(file_name: String, data: Vec<u8>){
     let file_len = metadata.len();
     debug!("file length before adding chunk: {file_len}");
 
-    file.write_all(&data).unwrap();
+    let write_data: Vec<u8> = if file_name.ends_with(".json") {
+        serde_json::from_slice::<serde_json::Value>(&data)
+            .ok()
+            .map(|v| json_pretty(&v, 0).into_bytes())
+            .unwrap_or(data)
+    } else {
+        data
+    };
+    file.write_all(&write_data).unwrap();
     let metadata = fs::metadata(path).unwrap();
     let file_len = metadata.len();
     debug!("file length after adding chunk: {file_len}");
