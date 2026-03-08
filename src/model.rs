@@ -61,47 +61,46 @@ pub fn load_mesh(
     )?;
 
 
-    let model = &models[0];
-    let mesh = &model.mesh;
-
     let color_arr = [color[0], color[1], color[2]];
     let mut vertices = Vec::new();
-    let positions = &mesh.positions;
-    for i in 0..positions.len() / 3 {
-        let position = [
-            mesh.positions[i*3],
-            mesh.positions[i*3 + 1],
-            mesh.positions[i*3 + 2],
-        ];
+    let mut indices = Vec::new();
 
-        vertices.push(ModelVertex {
-            position: position,
-            color: color_arr,
-        });
-
-
+    for model in &models {
+        let mesh = &model.mesh;
+        let vertex_offset = vertices.len() as u32;
+        let positions = &mesh.positions;
+        for i in 0..positions.len() / 3 {
+            vertices.push(ModelVertex {
+                position: [
+                    mesh.positions[i*3],
+                    mesh.positions[i*3 + 1],
+                    mesh.positions[i*3 + 2],
+                ],
+                color: color_arr,
+            });
+        }
+        for &idx in &mesh.indices {
+            indices.push(vertex_offset + idx);
+        }
     }
-
-    let vertex_data = bytemuck::cast_slice(&vertices);
-    let index_data = bytemuck::cast_slice(&mesh.indices);
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Vertex Buffer"),
-        contents: vertex_data,
+        contents: bytemuck::cast_slice(&vertices),
         usage: wgpu::BufferUsages::VERTEX,
     });
 
     let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Index Buffer"),
-        contents: index_data,
+        contents: bytemuck::cast_slice(&indices),
         usage: wgpu::BufferUsages::INDEX,
     });
 
     Ok(Mesh {
-        name: model.name.clone(),
+        name: models[0].name.clone(),
         vertex_buffer,
         index_buffer,
-        num_elements: mesh.indices.len() as u32,
+        num_elements: indices.len() as u32,
     })
 }
 
