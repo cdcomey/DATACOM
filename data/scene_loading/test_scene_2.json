@@ -58,70 +58,70 @@
         {   
             "Name": "ATP-XW Blizzard",
             "Position": [0.0, 10.0, 0.0],
-            "Rotation": [0.0, 0.0, 0.0],
+            "Rotation": [1.0, 0.0, 0.0, 0.0],
             "Scale": [1.0, 1.0, 1.0],
             "Models": [
                 {
                     "Name": "Blizzard",
-                    "ObjectFilePath": "data/blizzard.obj",
+                    "ObjectFilePath": "test_data/blizzard.obj",
                     "Position": [0.0, 0.0, 0.0],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 1.0, 0.0]
                 },
                 {
                     "Name": "propeller FLT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, -2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller FLB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, -2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 },
                 {
                     "Name": "propeller FRT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, 2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 },
                 {
                     "Name": "propeller FRB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, 2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller RLT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, -2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 },
                 {
                     "Name": "propeller RLB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, -2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller RRT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, 2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller RRB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, 2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 }
             ],
@@ -277,70 +277,70 @@
         {   
             "Name": "ATP-XW Blizzard",
             "Position": [-5.0, -5.0, 0.0],
-            "Rotation": [0.0, 0.0, 0.0],
+            "Rotation": [1.0, 0.0, 0.0, 0.0],
             "Scale": [0.25, 0.25, 0.25],
             "Models": [
                 {
                     "Name": "Blizzard",
-                    "ObjectFilePath": "data/blizzard.obj",
+                    "ObjectFilePath": "test_data/blizzard.obj",
                     "Position": [0.0, 0.0, 0.0],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 1.0, 0.0]
                 },
                 {
                     "Name": "propeller FLT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, -2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller FLB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, -2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 },
                 {
                     "Name": "propeller FRT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, 2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 },
                 {
                     "Name": "propeller FRB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [-0.72, 2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller RLT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, -2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 },
                 {
                     "Name": "propeller RLB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, -2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller RRT",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, 2.928, 1.191],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [1.0, 0.0, 0.0]
                 },
                 {
                     "Name": "propeller RRB",
-                    "ObjectFilePath": "data/prop.obj",
+                    "ObjectFilePath": "test_data/prop.obj",
                     "Position": [4.220, 2.928, 0.891],
-                    "Rotation": [0.0,0.0,0.0],
+                    "Rotation": [1.0, 0.0, 0.0, 0.0],
                     "Color": [0.0, 0.0, 1.0]
                 }
             ],
