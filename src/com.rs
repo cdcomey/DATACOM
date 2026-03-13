@@ -36,7 +36,7 @@ const CHUNK_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_
 const FILE_END_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH;
 const CHECKSUM_WIDTH: usize = 4;
 
-const SECONDS_UNTIL_TIMEOUT: u64 = 10;
+const SECONDS_UNTIL_TIMEOUT: u64 = 30;
 const TIMEOUT_THRESHOLD: Duration = Duration::from_secs(SECONDS_UNTIL_TIMEOUT);
 const MAX_CHUNK_TRANSMIT_ATTEMPTS: u8 = 5;
 static FILE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -501,7 +501,7 @@ fn json_pretty(value: &serde_json::Value, depth: usize) -> String {
 fn append_to_file(file_name: String, data: Vec<u8>){
     let dir = if file_name.ends_with(".obj") {
         "data/object_loading"
-    } else if file_name.ends_with(".json") {
+    } else if file_name.ends_with(".json") || file_name.ends_with(".bin") {
         "data/scene_loading"
     } else {
         "."
