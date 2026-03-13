@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::time::Duration;
 use std::collections::HashSet;
+use log::debug;
 
 use crate::behaviors_and_entities::Entity;
 
@@ -294,8 +295,8 @@ impl CameraController {
         //     self.camera.pitch = Rad(SAFE_FRAC_PI_2);
         // }
 
-        // println!("new camera position: ({}, {}, {})", self.camera.position[0], self.camera.position[1], self.camera.position[2]);
-        // println!("new camera rotation: ({:?}, {:?}, {:?})", self.camera.roll, self.camera.pitch, self.camera.yaw);
+        debug!("new camera position: ({}, {}, {})", self.camera.position[0], self.camera.position[1], self.camera.position[2]);
+        debug!("new camera rotation: {:?}", self.camera.rotation);
     }
 
     fn update_camera_orbit(&mut self, dt: Duration){
