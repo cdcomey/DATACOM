@@ -713,6 +713,11 @@ impl Scene {
         render_pass.set_pipeline(terrain_render_pipeline);
         render_pass.draw_terrain(&self.terrain, camera_bind_group);
 
+        render_pass.set_pipeline(lines_render_pipeline);
+        for entity in self.entities.iter() {
+            entity.draw_trail(render_pass, camera_bind_group, &self.device);
+        }
+
         render_pass.set_pipeline(model_render_pipeline);
         for entity in self.entities.iter() {
             entity.draw(render_pass, camera_bind_group, queue);

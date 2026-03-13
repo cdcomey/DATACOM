@@ -240,7 +240,8 @@ pub async fn run_scene_from_network(args: Vec<String>){
 
     let port_string = "data/ports.toml".to_string();
 
-    if args.len() >= 3 && args[1] == "test" {
+    if args.len() >= 4 && args[1] == "test" {
+        println!("{}, {}, {}", args[0], args[1], args[2]);
         let server_test_result = server_test::create_server_thread(
             port_string.clone(),
             args[2].clone(),

@@ -10,13 +10,14 @@ use crate::com::{MAX_FILE_NAME_BYTE_WIDTH, get_ports, has_timed_out};
 
 
 fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
-    let path = std::path::Path::new(path_str);
+    let full_path = format!("data/scene_loading/{}", path_str);
+    let path = std::path::Path::new(&full_path);
     let test_command_data_main = fs::read_to_string(path).unwrap();
     let data_len = test_command_data_main.len();
 
     let message_type = 0u16;
-    let file_id = 0123456789u64;
-    let file_name_base = "data/scene_loading/main_scene.json";
+    let file_id: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let file_name_base = path_str;
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
@@ -24,7 +25,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
 
     let mut test_command_data: Vec<u8> = Vec::new();
     test_command_data.extend_from_slice(&message_type.to_be_bytes());
-    test_command_data.extend_from_slice(&file_id.to_be_bytes());
+    test_command_data.extend_from_slice(&file_id);
     test_command_data.extend_from_slice(&[file_name_length]);
     test_command_data.extend_from_slice(&file_name);
     test_command_data.extend_from_slice(&file_len.to_be_bytes());
@@ -43,7 +44,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
     while (chunk_offset as usize) < data_len {
         test_command_data.clear();
         test_command_data.extend_from_slice(&message_type.to_be_bytes());
-        test_command_data.extend_from_slice(&file_id.to_be_bytes());
+        test_command_data.extend_from_slice(&file_id);
         test_command_data.extend_from_slice(&chunk_offset.to_be_bytes());
 
         let chunk_offset_usize = chunk_offset as usize;
@@ -74,7 +75,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
     let message_type = 2u16;
     test_command_data.clear();
     test_command_data.extend_from_slice(&message_type.to_be_bytes());
-    test_command_data.extend_from_slice(&file_id.to_be_bytes());
+    test_command_data.extend_from_slice(&file_id);
 
     info!("Sending file end to stream");
     debug!("{:?}", test_command_data);
@@ -95,8 +96,8 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
 
 fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     let message_type = 0u16;
-    let file_id = 1212121212u64;
-    let file_name_base = "data/scene_loading/entity_pos.bin";
+    let file_id: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let file_name_base = path_str;
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
@@ -104,7 +105,7 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
 
     let mut test_command_data: Vec<u8> = Vec::new();
     test_command_data.extend_from_slice(&message_type.to_be_bytes());
-    test_command_data.extend_from_slice(&file_id.to_be_bytes());
+    test_command_data.extend_from_slice(&file_id);
     test_command_data.extend_from_slice(&[file_name_length]);
     test_command_data.extend_from_slice(&file_name);
     test_command_data.extend_from_slice(&file_len.to_be_bytes());
@@ -127,7 +128,8 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     // stream.flush().unwrap();
     
     
-    let path: &Path = std::path::Path::new(path_str);
+    let full_path = format!("data/scene_loading/{}", path_str);
+    let path: &Path = std::path::Path::new(&full_path);
     let mut file = File::open(path).unwrap();
     let metadata = fs::metadata(path).unwrap();
     let file_len = metadata.len();
@@ -151,7 +153,7 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
 
         test_command_data.clear();
         test_command_data.extend_from_slice(&message_type.to_be_bytes());
-        test_command_data.extend_from_slice(&file_id.to_be_bytes());
+        test_command_data.extend_from_slice(&file_id);
         test_command_data.extend_from_slice(&chunk_offset.to_be_bytes());
         test_command_data.extend_from_slice(&(bytes_read as u32).to_be_bytes());
         test_command_data.extend_from_slice(&payload);

@@ -6,9 +6,11 @@ use std::path::Path;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek};
 use log::{debug, info, error};
-use cgmath::{EuclideanSpace, InnerSpace};
+use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
 use ndarray::{ArrayBase, OwnedRepr, Dim};
 use std::io::Write;
+
+use wgpu::util::DeviceExt;
 
 use crate::model;
 
@@ -18,17 +20,17 @@ pub const DATA_ARR_WIDTH: usize = 12;
 const AVERAGE_REFRESH_RATE: usize = 16;
 const F32_SIZE: usize = std::mem::size_of::<f32>();
 const CHUNK_LENGTH: u64 = 1024;
+const MAX_TRAIL_LENGTH: usize = 500;
 
 pub fn create_and_clear_file(file_name: &str) {
     let path = Path::new(file_name);
-    let mut file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(path)
         .unwrap();
     debug!("clearing {file_name}");
-    writeln!(file, "").unwrap();
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -93,6 +95,7 @@ impl Behavior {
             .unwrap()
             .into_iter()
             .collect();
+        debug!("initial behavior data length at start of function: {}", data_temp.len());
         let mut data: Vec<f32> = vec![];
         let data_file_path = if !BehaviorType::is_constant_behavior(behavior_type) {
             let mut path = data_temp.remove(0).to_string();
@@ -108,6 +111,7 @@ impl Behavior {
         for data_point in data_temp.iter() {
             data.push(data_point.as_f64().unwrap() as f32);
         }
+        debug!("initial behavior data length at end of function: {}", data.len());
 
         Behavior::new(behavior_type, data, data_file_path)
     }
@@ -156,7 +160,7 @@ impl Behavior {
 
             debug!("adding {:?} to entity data", &float_buffer[0..num_bytes_read / F32_SIZE]);
             self.data.extend_from_slice(&float_buffer[0..num_bytes_read / F32_SIZE]);
-            // debug!("data = {:?}", &self.data);
+            debug!("data = {:?}", &self.data);
 
             
             // delete the chunk from the file
@@ -172,7 +176,7 @@ impl Behavior {
             std::fs::rename(&temp_path, target_file_path).unwrap();
             let metadata = fs::metadata(&target_file_path).unwrap();
             let file_len = metadata.len();
-            debug!("file length before deleting chunk: {file_len}");
+            debug!("file length after deleting chunk: {file_len}");
 
         }
     }
@@ -186,6 +190,30 @@ pub struct Entity {
     scale: Vector3<f32>,
     models: Vec<model::Model>,
     behaviors: Vec<Behavior>,
+    trail: Vec<Point3<f32>>,
+    trail_bind_group: Option<wgpu::BindGroup>,
+    trail_uniform_buffer: Option<wgpu::Buffer>,
+}
+
+fn has_movement_behavior(behaviors: &[Behavior]) -> bool {
+    behaviors.iter().any(|b| matches!(b.behavior_type,
+        BehaviorType::EntityTranslate | BehaviorType::EntityChangeTransform | BehaviorType::ComponentTranslate
+    ))
+}
+
+fn create_trail_resources(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let identity: [[f32; 4]; 4] = Matrix4::identity().into();
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Trail Uniform Buffer"),
+        contents: bytemuck::cast_slice(&[identity]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        label: Some("Trail Bind Group"),
+    });
+    (buffer, bind_group)
 }
 
 impl Entity {
@@ -247,6 +275,13 @@ impl Entity {
             None => vec![],
         };
 
+        let (trail_uniform_buffer, trail_bind_group) = if has_movement_behavior(&behavior_vec) {
+            let (buf, bg) = create_trail_resources(device, model_bind_group_layout);
+            (Some(buf), Some(bg))
+        } else {
+            (None, None)
+        };
+
         Entity {
             name: name,
             position: Rc::new(RefCell::new(position)),
@@ -254,6 +289,9 @@ impl Entity {
             scale: scale_vec,
             models: model_vec,
             behaviors: behavior_vec,
+            trail: Vec::new(),
+            trail_bind_group,
+            trail_uniform_buffer,
         }
     }
 
@@ -300,6 +338,7 @@ impl Entity {
         // println!("BEHAVIOR: {:?}", behavior_vec[0].data);
 
         // return entity
+        let (buf, bg) = create_trail_resources(device, model_bind_group_layout);
         Ok(
             Entity {
                 name: name,
@@ -308,6 +347,9 @@ impl Entity {
                 scale: scale,
                 models: model_vec,
                 behaviors: behavior_vec,
+                trail: Vec::new(),
+                trail_bind_group: Some(bg),
+                trail_uniform_buffer: Some(buf),
             }
         )
     }
@@ -319,8 +361,44 @@ impl Entity {
     pub fn get_position(&self) -> Rc<RefCell<Point3<f32>>> { Rc::clone(&self.position) }
 
     pub fn set_position(&mut self, new_position: Point3<f32>) {
+        if self.trail_bind_group.is_some() {
+            self.trail.push(*self.position.borrow());
+            if self.trail.len() > MAX_TRAIL_LENGTH {
+                self.trail.remove(0);
+            }
+        }
         *self.position.borrow_mut() = new_position;
-        // println!("new position: ({}, {}, {})", new_position[0], new_position[1], new_position[2]);
+        debug!("new entity position is {:?}", *self.position.borrow());
+    }
+
+    pub fn draw_trail<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        device: &wgpu::Device,
+    ) {
+        let Some(ref trail_bg) = self.trail_bind_group else { return };
+        if self.trail.len() < 2 { return }
+
+        let color = self.models.first()
+            .map_or([1.0f32, 1.0, 1.0], |m| [m.color.x, m.color.y, m.color.z]);
+
+        let mut verts: Vec<model::ModelVertex> = Vec::with_capacity((self.trail.len() - 1) * 2);
+        for w in self.trail.windows(2) {
+            verts.push(model::ModelVertex { position: [w[0].x, w[0].y, w[0].z], color });
+            verts.push(model::ModelVertex { position: [w[1].x, w[1].y, w[1].z], color });
+        }
+
+        let trail_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Trail Vertex Buffer"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        render_pass.set_vertex_buffer(0, trail_vbuf.slice(..));
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, trail_bg, &[]);
+        render_pass.draw(0..verts.len() as u32, 0..1);
     }
 
     pub fn rotate(&mut self, rotation: cgmath::Quaternion<f32>){
@@ -404,23 +482,27 @@ impl Entity {
 
                 if data_len < (CHUNK_LENGTH as usize) * DATA_ARR_WIDTH {
                     // self.behaviors[behavior_index].data.drain(0..counter+DATA_ARR_WIDTH);
-                    debug!("data len of {} is less than threshold of {}", data_len, (CHUNK_LENGTH as usize) * DATA_ARR_WIDTH);
+                    debug!("data len of {} is less than threshold of {}; attempting to retrieve data chunk", data_len, (CHUNK_LENGTH as usize) * DATA_ARR_WIDTH);
                     behavior.retrieve_data_chunk();
                 }
+
+                let data_len = behavior.data.len();
 
                 if data_len >= DATA_ARR_WIDTH {
                     // let new_position = Point3::<f32>::new(behavior.data[counter], behavior.data[counter+1], behavior.data[counter+2]);
                     // let rotation = Vector3::<f32>::new(behavior.data[counter+6], behavior.data[counter+7], behavior.data[counter+8]);
+                    debug!("reading from entity data: x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", behavior.data[0], behavior.data[1], behavior.data[2], behavior.data[6], behavior.data[7], behavior.data[8]);
                     let new_position = Point3::<f32>::new(behavior.data[0], behavior.data[1], behavior.data[2]);
                     let rotation = Vector3::<f32>::new(behavior.data[6], behavior.data[7], behavior.data[8]);
                     self.rotation = Quaternion::from_sv(1.0, rotation);
                     // debug!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", behavior.data[0], behavior.data[1], behavior.data[2], behavior.data[6], behavior.data[7], behavior.data[8]);
-                    debug!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", new_position.x, new_position.y, new_position.z, rotation.x, rotation.y, rotation.z);
+                    // info!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", new_position.x, new_position.y, new_position.z, rotation.x, rotation.y, rotation.z);
                     behavior.data.drain(0..DATA_ARR_WIDTH);
                     
                     self.set_position(new_position);
                 } else {
-                    debug!("Entity has run out of data and is stalling at last known transform");
+                    let position = *self.position.borrow();
+                    info!("Entity has run out of data and is stalling at last known transform: pos ({}, {}, {})", position.x, position.y, position.z);
                 }
 
             }
