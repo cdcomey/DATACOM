@@ -5,7 +5,7 @@
 *.mp4
 *.txt
 tmp.py
-data/scene_loading/entity_pos.bin
-data/scene_loading/main_scene.json
+data/scene_loading/test_data/*
+data/object_loading/test_data/*
 .DS_Store
 Cargo.lock
