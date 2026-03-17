@@ -17,7 +17,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
 
     let message_type = 0u16;
     let file_id: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-    let file_name_base = path_str;
+    let file_name_base = "main_scene.json";
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
@@ -97,7 +97,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
 fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     let message_type = 0u16;
     let file_id: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-    let file_name_base = path_str;
+    let file_name_base = "entity_pos.bin";
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
@@ -128,7 +128,7 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     // stream.flush().unwrap();
     
     
-    let full_path = format!("data/scene_loading/{}", path_str);
+    let full_path = format!("data/object_loading/{}", path_str);
     let path: &Path = std::path::Path::new(&full_path);
     let mut file = File::open(path).unwrap();
     let metadata = fs::metadata(path).unwrap();
