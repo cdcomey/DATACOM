@@ -494,7 +494,8 @@ impl Entity {
                     debug!("reading from entity data: x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", behavior.data[0], behavior.data[1], behavior.data[2], behavior.data[6], behavior.data[7], behavior.data[8]);
                     let new_position = Point3::<f32>::new(behavior.data[0], behavior.data[1], behavior.data[2]);
                     let rotation = Vector3::<f32>::new(behavior.data[6], behavior.data[7], behavior.data[8]);
-                    self.rotation = Quaternion::from_sv(1.0, rotation);
+                    let w = (1.0 - rotation.magnitude2()).max(0.0).sqrt();
+                    self.rotation = Quaternion::from_sv(w, rotation);
                     // debug!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", behavior.data[0], behavior.data[1], behavior.data[2], behavior.data[6], behavior.data[7], behavior.data[8]);
                     // info!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", new_position.x, new_position.y, new_position.z, rotation.x, rotation.y, rotation.z);
                     behavior.data.drain(0..DATA_ARR_WIDTH);
@@ -502,7 +503,7 @@ impl Entity {
                     self.set_position(new_position);
                 } else {
                     let position = *self.position.borrow();
-                    info!("Entity has run out of data and is stalling at last known transform: pos ({}, {}, {})", position.x, position.y, position.z);
+                    debug!("Entity has run out of data and is stalling at last known transform: pos ({}, {}, {})", position.x, position.y, position.z);
                 }
 
             }
