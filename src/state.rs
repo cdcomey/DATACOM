@@ -29,7 +29,7 @@ pub struct State<'a> {
     lines_render_pipeline: wgpu::RenderPipeline,
     text_render_pipeline: wgpu::RenderPipeline,
     terrain_render_pipeline: wgpu::RenderPipeline,
-    scene: Scene,
+    pub scene: Scene,
     window: &'a Window,
     pub framerate: f32,
     pub mouse_pressed: bool,

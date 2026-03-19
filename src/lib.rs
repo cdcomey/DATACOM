@@ -217,6 +217,11 @@ pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
                                     log::warn!("Surface timeout")
                                 }
                             }
+
+                            if should_save_to_file && state.scene.capture_complete() {
+                                state.scene.finish_capture(state.size.width, state.size.height);
+                                control_flow.exit();
+                            }
                         }
                         _ => {}
                     }
@@ -227,7 +232,7 @@ pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
         .unwrap();
 }
 
-pub async fn run_scene_from_network(args: Vec<String>){
+pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     debug!("Running lib.rs::run_scene_from_network()");
 
     // TODO: change to something more generic
@@ -326,9 +331,9 @@ pub async fn run_scene_from_network(args: Vec<String>){
                             let now = std::time::Instant::now();
                             let dt = now - last_render_time;
                             last_render_time = now;
-                            state.update(dt, false);
+                            state.update(dt, should_save_to_file);
 
-                            match state.render(false) {
+                            match state.render(should_save_to_file) {
                                 Ok(_) => {}
                                 // Reconfigure the surface if it's lost or outdated
                                 Err(
@@ -353,7 +358,12 @@ pub async fn run_scene_from_network(args: Vec<String>){
             }
             
             debug!("M: reading streamed files...");
-            com::receive_file(&rx_listener, &tx_sender, &mut active_files, &mut buf);
+            if com::receive_file(&rx_listener, &tx_sender, &mut active_files, &mut buf) {
+                if should_save_to_file {
+                    state.scene.finish_capture(state.size.width, state.size.height);
+                }
+                control_flow.exit();
+            }
         })
         .unwrap();
 

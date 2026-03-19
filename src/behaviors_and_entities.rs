@@ -416,7 +416,7 @@ impl Entity {
 
     pub fn find_timesteps(&self) -> Option<usize> {
         for behavior in self.behaviors.iter() {
-            if !behavior.is_constant_behavior {
+            if !behavior.is_constant_behavior && behavior.data.len() > 0 {
                 return Some(behavior.data.len())
             }
         }
@@ -476,7 +476,7 @@ impl Entity {
 
             // Change position to input
             BehaviorType::EntityChangeTransform => {
-                let counter = data_counter.expect("Error in Entity::run_behavior : data counter is None");
+                let counter = data_counter.unwrap_or(0);
                 let data_len = behavior.data.len();
                 debug!("counter = {}, data len = {}", counter, data_len);
 

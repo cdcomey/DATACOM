@@ -56,8 +56,8 @@ use datacom::{run_scene_from_hdf5, run_scene_from_json, run_scene_from_network};
 fn main() {
     pretty_env_logger::init();
     let args: Vec<String> = std::env::args().collect();
+    let should_save_to_file = args[args.len()-1] == "y";
 
-    let should_save_to_file = args.len() > 2 && args[2] == "y";
 
     if args.len() > 1 {
         if args[1].ends_with(".hdf5") {
@@ -68,10 +68,10 @@ fn main() {
             pollster::block_on(run_scene_from_json(args));
         } else {
             // assume user wants the scene constructed from a TCP connection
-            pollster::block_on(run_scene_from_network(args));
+            pollster::block_on(run_scene_from_network(args, should_save_to_file));
         }
     } else {
         // assume user wants the scene constructed from a TCP connection
-        pollster::block_on(run_scene_from_network(args));
+        pollster::block_on(run_scene_from_network(args, should_save_to_file));
     }
 }

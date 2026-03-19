@@ -118,16 +118,6 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     stream.write_all(&test_command_data[..]).unwrap();
     stream.flush().unwrap();
 
-    // let message_type = 4u16;
-    // test_command_data.clear();
-    // test_command_data.extend_from_slice(&message_type.to_be_bytes());
-
-    // info!("Sending transmission end to stream");
-    // thread::sleep(Duration::from_millis(10));
-    // stream.write_all(&test_command_data[..]).unwrap();
-    // stream.flush().unwrap();
-    
-    
     let full_path = format!("data/object_loading/{}", path_str);
     let path: &Path = std::path::Path::new(&full_path);
     let mut file = File::open(path).unwrap();
@@ -166,6 +156,25 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
         stream.write_all(&test_command_data[..]).unwrap();
         stream.flush().unwrap();
     }
+
+    let message_type = 2u16;
+    test_command_data.clear();
+    test_command_data.extend_from_slice(&message_type.to_be_bytes());
+    test_command_data.extend_from_slice(&file_id);
+
+    info!("S: Sending file end to stream");
+    thread::sleep(Duration::from_millis(10));
+    stream.write_all(&test_command_data[..]).unwrap();
+    stream.flush().unwrap();
+
+    let message_type = 4u16;
+    test_command_data.clear();
+    test_command_data.extend_from_slice(&message_type.to_be_bytes());
+
+    info!("S: Sending transmission end to stream");
+    thread::sleep(Duration::from_millis(10));
+    stream.write_all(&test_command_data[..]).unwrap();
+    stream.flush().unwrap();
 }
 
 pub fn create_server_thread(
@@ -196,7 +205,7 @@ pub fn create_server_thread(
                         info!("server thread received ACK");
                         let stream_clone = stream.try_clone();
                         send_finite_test_data(stream, &json_file_path);
-                        thread::sleep(Duration::from_secs(3));
+                        thread::sleep(Duration::from_secs(1));
                         send_streamed_test_data(stream_clone.unwrap(), &bin_file_path);
                     }
                     

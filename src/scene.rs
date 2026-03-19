@@ -590,7 +590,8 @@ impl Scene {
     ) -> Scene {
         let mut json: serde_json::Value = serde_json::from_str(&json_unparsed).unwrap();
         let total_timesteps = json["total_timesteps"].as_u64();
-        let total_timesteps = total_timesteps.map(|e| e as usize);
+        // total_timesteps in JSON is a frame count; scale to match data_counter which advances by DATA_ARR_WIDTH per frame
+        let total_timesteps = total_timesteps.map(|e| e as usize * behaviors_and_entities::DATA_ARR_WIDTH);
         let data_counter = total_timesteps.map(|_| 0 as usize);
         let terrain = model::Terrain::new(json["terrain"].take(), &device);
 
@@ -774,18 +775,19 @@ impl Scene {
             );
 
             self.increment_frame_counter();
-            
-            if self.data_counter > self.total_timesteps {
-                println!("sim finished; time to save");
-                self.read_remaining_buffers(device, width, height);
-                println!("{} total frames recorded", self.screen_recordings.len());
-                Scene::save_screen_data_to_file(&self.screen_recordings);
-                // send window close event instead of panicking
-                panic!();
-            }
-
     }
-    
+
+    pub fn capture_complete(&self) -> bool {
+        self.data_counter > self.total_timesteps
+    }
+
+    pub fn finish_capture(&mut self, width: u32, height: u32) {
+        let device = self.device.clone();
+        self.read_remaining_buffers(&device, width, height);
+        println!("{} total frames recorded", self.screen_recordings.len());
+        Scene::save_screen_data_to_file(&self.screen_recordings);
+    }
+
     fn write_screen_to_capture_buf(device: &Device, queue: &Queue, texture: &wgpu::Texture, capture_buffers: &mut Vec<wgpu::Buffer>, width: u32, height: u32, index: usize){
         let padded_bytes_per_row = ((width * BYTES_PER_PIXEL + 255) / 256) * 256;
 
