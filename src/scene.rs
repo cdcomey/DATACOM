@@ -781,6 +781,10 @@ impl Scene {
         self.data_counter > self.total_timesteps
     }
 
+    pub fn all_streams_exhausted(&self) -> bool {
+        self.entities.iter().all(|e| e.all_streams_exhausted())
+    }
+
     pub fn finish_capture(&mut self, width: u32, height: u32) {
         let device = self.device.clone();
         self.read_remaining_buffers(&device, width, height);
@@ -865,7 +869,7 @@ impl Scene {
         let mut ffmpeg_process = Command::new("ffmpeg")
             .args(&[
                 "-f", "rawvideo", //    input is raw video pixels
-                "-pix_fmt", "rgba", //  RGBA format
+                "-pix_fmt", "bgra", //  BGRA format (wgpu surface on macOS is Bgra8Unorm)
                 "-s", "1600x1200", //   dimensions
                 "-r", "60", //          fps
                 "-i", "pipe:0", //      read input from stdin

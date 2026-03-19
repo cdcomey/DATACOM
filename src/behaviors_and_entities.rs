@@ -180,6 +180,14 @@ impl Behavior {
 
         }
     }
+
+    pub fn is_exhausted(&self) -> bool {
+        let file_empty = match &self.data_file_path {
+            None => true,
+            Some(path) => fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true),
+        };
+        file_empty && self.data.len() < DATA_ARR_WIDTH
+    }
 }
 
 #[allow(dead_code)]
@@ -531,6 +539,10 @@ impl Entity {
         for i in 0..self.behaviors.len() {
             self.run_behavior(i, data_counter);
         }
+    }
+
+    pub fn all_streams_exhausted(&self) -> bool {
+        self.behaviors.iter().all(|b| b.is_exhausted())
     }
 
     pub fn get_model(&mut self, model_component_id: u64) -> &mut model::Model {

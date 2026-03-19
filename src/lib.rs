@@ -291,6 +291,7 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
     // State::new uses async code, so we're going to wait for it to finish
     let mut state = state::State::new(&window, scene_file).await;
     let mut last_render_time = std::time::Instant::now();
+    let mut transmission_ended = false;
 
     // com::create_listener_thread(tx).unwrap();
     debug!("about to start event loop");
@@ -359,6 +360,9 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
             
             debug!("M: reading streamed files...");
             if com::receive_file(&rx_listener, &tx_sender, &mut active_files, &mut buf) {
+                transmission_ended = true;
+            }
+            if transmission_ended && state.scene.all_streams_exhausted() {
                 if should_save_to_file {
                     state.scene.finish_capture(state.size.width, state.size.height);
                 }
