@@ -2,15 +2,23 @@
 
 **Source-Agnostic 3D Data Visualization Engine**
 
-DATACOM is a general-purpose 3D visualization engine built with Rust and OpenGL, designed to serve as a visual terminal interface for real-time data streaming applications. Originally developed as a command-and-control interface for UAV swarm behavior, DATACOM has evolved into a flexible, source-agnostic platform capable of receiving and displaying multiple concurrent data streams.
+DATACOM is a real-time 3D visualization engine written in Rust, built on WebGPU (wgpu) with custom WGSL shaders. It functions as a visual terminal for live data streams: a server sends scene definitions, 3D models, and per-frame transform data over a custom binary TCP protocol, and DATACOM assembles and renders the scene in real time. Originally developed as a command-and-control interface for UAV swarm behavior, it has evolved into a source-agnostic platform capable of receiving and displaying multiple concurrent data streams.
+
+## Technical Highlights
+
+- **Custom binary streaming protocol** — hand-crafted TCP framing with CRC32 checksums, out-of-order chunk reassembly via an internal reorder buffer, retransmission requests, and graceful timeout handling. Chunks for multiple files can arrive interleaved and are reassembled by file ID and byte offset.
+- **Multi-pipeline WebGPU renderer** — five independent wgpu render pipelines (3D models, terrain, lines, text overlay, UI rectangles) with separate bind group layouts and WGSL shaders. Supports multiple simultaneous viewports, each with its own perspective camera.
+- **Multi-threaded streaming architecture** — dedicated listener and sender threads coordinate with the main render loop via mpsc channels, with no shared mutable state. Supports both finite file transfers and indefinite live data streams.
+- **HDF5 scientific data integration** — reads multi-dimensional trajectory datasets (position, rotation across timesteps) and maps them to a frame-by-frame behavior system with Euler-to-quaternion conversion.
 
 ## Features
 
-- **Source-Agnostic Design**: Accept data from any source with proper formatting
-- **Multi-Stream Support**: Display multiple incoming data streams simultaneously
+- **Source-Agnostic Design**: Accept scene and transform data from any source with proper formatting
+- **Multi-Viewport Support**: Multiple simultaneous viewports with independent cameras
 - **Real-Time Visualization**: Stream and visualize live data with low latency
-- **3D Rendering**: OpenGL-based rendering engine with support for complex scenes
-- **Flexible Entity System**: Dynamic entity management with customizable behaviors
+- **WebGPU Rendering**: wgpu-based engine with WGSL shaders and support for complex scenes
+- **Flexible Entity System**: Dynamic entity management with composable, frame-driven behaviors
+- **Multiple Data Modes**: Load scenes from JSON, HDF5 scientific data files, or live network streams
 
 ## Prerequisites
 
@@ -276,10 +284,6 @@ Client (DATACOM)          Server (Data Source)
      |         ...               |
 ```
 
-## Development Status
-
-This project is currently under active development and is not intended for public use. The repository has been made temporarily public for applications.
-
 ## License
 
 GPL-3.0 License
@@ -294,4 +298,4 @@ GPL-3.0 License
 
 ---
 
-**Note**: This is specialized software developed for research and UAV visualization applications. For questions or collaboration inquiries, please open an issue.
+For questions or collaboration inquiries, please open an issue.
