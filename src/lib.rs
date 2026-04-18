@@ -4,8 +4,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 use std::sync::mpsc;
-use std::collections::HashMap;
-use uuid::Uuid;
 use log::{info, debug};
 use std::fs::remove_file;
 
@@ -240,9 +238,6 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
     let scene_file = scene_file_string.as_str();
     behaviors_and_entities::create_and_clear_file(scene_file);
 
-    let (tx_sender, rx_sender): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
-    let (tx_listener, rx_listener): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
-
     let port_string = "data/ports.toml".to_string();
 
     if args.len() >= 4 && args[1] == "test" {
@@ -255,26 +250,31 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         server_test_result.unwrap();
     }
 
-    let stream = com::connect_to_tcp_stream(port_string);
-    let listener_result = com::create_listener_thread(tx_listener, stream.try_clone().unwrap());
-    let listener = listener_result.unwrap();
+    let (tx_assembly, rx_assembly) = mpsc::channel::<com::AssemblyMessage>();
+    let streams = com::connect_to_all_tcp_streams(port_string);
+    let num_streams = streams.len();
+    let mut listeners = Vec::new();
 
-    let _sender_result = com::create_sender_thread(rx_sender, stream);
+    for stream in streams {
+        let (tx_listener, rx_listener) = mpsc::channel::<Vec<u8>>();
+        let (tx_sender, rx_sender) = mpsc::channel::<Vec<u8>>();
+        let listener = com::create_listener_thread(tx_listener, stream.try_clone().unwrap()).unwrap();
+        listeners.push(listener);
+        com::create_sender_thread(rx_sender, stream).unwrap();
+        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone()).unwrap();
+    }
 
-    // files that the receiver is getting data about and writing to
-    let mut active_files: HashMap<Uuid, com::FileInfo> = HashMap::new();
-    let mut buf: Vec<u8> = Vec::new();
-    
     // initial file transfer
+    let mut completed = 0;
     loop {
-        // debug!("active files len = {}", active_files.len());
-        if listener.is_finished() || com::receive_file(&rx_listener, &tx_sender, &mut active_files, &mut buf){
-            break;
+        if listeners.iter().any(|l| l.is_finished()) { break; }
+        if matches!(rx_assembly.try_recv(), Ok(com::AssemblyMessage::TransmissionComplete)) {
+            completed += 1;
+            if completed == num_streams { break; }
         }
     }
 
-    if listener.is_finished() {
-        // clean up
+    if listeners.iter().any(|l| l.is_finished()) {
         remove_file("data/scene_loading/main_scene.json").unwrap();
         panic!("listener thread terminated before event loop could start");
     }
@@ -292,6 +292,7 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
     let mut state = state::State::new(&window, scene_file).await;
     let mut last_render_time = std::time::Instant::now();
     let mut transmission_ended = false;
+    let mut transmissions_remaining = num_streams;
 
     // com::create_listener_thread(tx).unwrap();
     debug!("about to start event loop");
@@ -359,8 +360,11 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
             }
             
             debug!("M: reading streamed files...");
-            if com::receive_file(&rx_listener, &tx_sender, &mut active_files, &mut buf) {
-                transmission_ended = true;
+            if matches!(rx_assembly.try_recv(), Ok(com::AssemblyMessage::TransmissionComplete)) {
+                transmissions_remaining -= 1;
+                if transmissions_remaining == 0 {
+                    transmission_ended = true;
+                }
             }
             if transmission_ended && state.scene.all_streams_exhausted() {
                 if should_save_to_file {

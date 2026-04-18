@@ -221,6 +221,26 @@ fn connect_to_ip_addr(addrs: &[SocketAddr], timeout: Duration) -> std::io::Resul
     }))
 }
 
+pub fn connect_to_all_tcp_streams(file: String) -> Vec<TcpStream> {
+    let ports = get_ports(file.as_str()).unwrap();
+    let port_connect_timeout = Duration::from_millis(100);
+
+    ports.iter().filter_map(|addr| {
+        let start_time = std::time::Instant::now();
+        while !has_timed_out(start_time) {
+            match TcpStream::connect_timeout(addr, port_connect_timeout) {
+                Ok(stream) => {
+                    info!("Connected to {}", addr);
+                    return Some(stream);
+                }
+                Err(_) => {}
+            }
+        }
+        info!("Timed out connecting to {}", addr);
+        None
+    }).collect()
+}
+
 pub fn connect_to_tcp_stream(file: String) -> TcpStream {
     let ports = get_ports(file.as_str()).unwrap();
     let addrs_iter = &(ports[..]);
@@ -272,6 +292,28 @@ pub fn create_listener_thread<'a>(tx: Sender<Vec<u8>>, stream: TcpStream) -> Res
     })
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Thread spawn failed"))?;
 
+    Ok(handle)
+}
+
+pub enum AssemblyMessage {
+    TransmissionComplete,
+}
+
+pub fn create_assembly_thread(
+    rx: Receiver<Vec<u8>>,
+    tx_sender: Sender<Vec<u8>>,
+    tx_main: Sender<AssemblyMessage>,
+) -> Result<thread::JoinHandle<()>, std::io::Error> {
+    let handle = thread::Builder::new().name("assembly thread".to_string()).spawn(move || {
+        let mut active_files: HashMap<Uuid, FileInfo> = HashMap::new();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            if receive_file(&rx, &tx_sender, &mut active_files, &mut buf) {
+                let _ = tx_main.send(AssemblyMessage::TransmissionComplete);
+            }
+        }
+    })
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Thread spawn failed"))?;
     Ok(handle)
 }
 
