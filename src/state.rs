@@ -94,7 +94,7 @@ impl<'a> State<'a> {
         })
     }
 
-    pub async fn new(window: &'a Window, filepath: &str) -> State<'a> {
+    pub async fn new(window: &'a Window, filepath: &str, registry: crate::ring_buffer::BufferRegistry) -> State<'a> {
         let size = window.inner_size();
         // println!("window size: {} * {} = {}", size.width, size.height, size.width * size.height);
 
@@ -285,6 +285,7 @@ impl<'a> State<'a> {
             &ortho_matrix_bind_group_layout,
             size.width,
             size.height,
+            registry,
         );
 
         let render_pipeline = {

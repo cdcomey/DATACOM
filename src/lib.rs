@@ -3,11 +3,12 @@ use winit::{
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
 };
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use log::{info, debug};
 use std::fs::remove_file;
 
 mod behaviors_and_entities;
+mod ring_buffer;
 mod scene;
 mod state;
 mod model;
@@ -34,7 +35,7 @@ pub async fn run_scene_from_json(args: Vec<String>) {
     let scene_file = scene_file_string.as_str();
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = state::State::new(&window, scene_file).await;
+    let mut state = state::State::new(&window, scene_file, ring_buffer::new_registry()).await;
     let mut last_render_time = std::time::Instant::now();
 
     // com::create_listener_thread(tx).unwrap();
@@ -124,7 +125,7 @@ pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
     scene_file_string.push_str(&args[1]);
     let scene_file = scene_file_string.as_str();
 
-    let mut state = state::State::new(&window, scene_file).await;
+    let mut state = state::State::new(&window, scene_file, ring_buffer::new_registry()).await;
     let mut last_render_time = std::time::Instant::now();
 
     // State::update() calls scene.run_behaviors(), which calls entity.run_behaviors() on every entity
@@ -250,6 +251,8 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         server_test_result.unwrap();
     }
 
+    let registry = ring_buffer::new_registry();
+
     let (tx_assembly, rx_assembly) = mpsc::channel::<com::AssemblyMessage>();
     let streams = com::connect_to_all_tcp_streams(port_string);
     let num_streams = streams.len();
@@ -261,7 +264,7 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         let listener = com::create_listener_thread(tx_listener, stream.try_clone().unwrap()).unwrap();
         listeners.push(listener);
         com::create_sender_thread(rx_sender, stream).unwrap();
-        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone()).unwrap();
+        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone(), Arc::clone(&registry)).unwrap();
     }
 
     // initial file transfer
@@ -289,7 +292,7 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         .unwrap();
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = state::State::new(&window, scene_file).await;
+    let mut state = state::State::new(&window, scene_file, registry).await;
     let mut last_render_time = std::time::Instant::now();
     let mut transmission_ended = false;
     let mut transmissions_remaining = num_streams;

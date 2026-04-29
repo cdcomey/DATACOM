@@ -108,8 +108,6 @@ pub fn load_mesh(
 pub struct Model {
     pub name: String,
     pub obj: Mesh,
-    pub position: cgmath::Point3<f32>,
-    pub rotation: cgmath::Quaternion<f32>,
     pub color: cgmath::Vector3<f32>,
     pub uniform_buffer: wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
@@ -117,16 +115,14 @@ pub struct Model {
 
 impl Model {
     pub fn new(
-        name: &str, 
-        filepath: &str, 
+        name: &str,
+        filepath: &str,
         device: &wgpu::Device,
-        position: cgmath::Point3<f32>, 
-        rotation: cgmath::Quaternion<f32>, 
         color: cgmath::Vector3<f32>,
         bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Model {
         let mesh = load_mesh(filepath, device, color)
-        .expect("Failed to load mesh in Model::new()");
+            .expect("Failed to load mesh in Model::new()");
 
         let model_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Model Uniform Buffer"),
@@ -143,39 +139,29 @@ impl Model {
             }],
             label: Some("Model Bind Group"),
         });
-        
+
         Model {
             name: name.to_string(),
             obj: mesh,
-            position: position,
-            rotation: rotation,
-            color: color,
+            color,
             uniform_buffer: model_uniform_buffer,
             bind_group: model_bind_group,
         }
     }
 
-    pub fn load_from_json_file(filepath: &str, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Vec<Model> {
+    pub fn load_from_json_file(filepath: &str, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Vec<(Model, cgmath::Point3<f32>, cgmath::Quaternion<f32>)> {
         let json_unparsed = std::fs::read_to_string(filepath).unwrap();
-        let json_string = json_unparsed.as_str();
-        let json_parsed: serde_json::Value = serde_json::from_str(json_string).unwrap();
-        
+        let json_parsed: serde_json::Value = serde_json::from_str(&json_unparsed).unwrap();
+
         match &json_parsed["Models"].as_array() {
-            Some(array) => {
-                let model_temp: Vec<_> = array.into_iter().collect();
-                let mut model_vec = vec![];
-                for i in model_temp.iter() {
-                    if let Some(m) = Model::load_from_json(*i, device, model_bind_group_layout) {
-                        model_vec.push(m);
-                    }
-                }
-                model_vec
-            }
+            Some(array) => array.iter()
+                .filter_map(|i| Model::load_from_json(i, device, model_bind_group_layout))
+                .collect(),
             None => vec![],
         }
     }
 
-    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Option<Model> {
+    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Option<(Model, cgmath::Point3<f32>, cgmath::Quaternion<f32>)> {
         let name = json["Name"].as_str().unwrap();
         let filepath_raw = json["ObjectFilePath"].as_str().unwrap();
         if filepath_raw.is_empty() {
@@ -195,7 +181,7 @@ impl Model {
             .iter()
             .map(|v| v.as_f64().unwrap() as f32)
             .collect();
-        let position_vec = cgmath::Point3::<f32>::new(position_arr[0], position_arr[1], position_arr[2]);
+        let position = cgmath::Point3::new(position_arr[0], position_arr[1], position_arr[2]);
 
         let rotation_arr: Vec<f32> = json["Rotation"]
             .as_array()
@@ -203,42 +189,15 @@ impl Model {
             .iter()
             .map(|v| v.as_f64().unwrap() as f32)
             .collect();
-        let rotation_vec = cgmath::Quaternion::new(rotation_arr[0], rotation_arr[1], rotation_arr[2], rotation_arr[3]);
+        let rotation = cgmath::Quaternion::new(rotation_arr[0], rotation_arr[1], rotation_arr[2], rotation_arr[3]);
 
-        let color_temp: Vec<_> = json["Color"]
-            .as_array()
-            .unwrap()
-            .into_iter()
-            .collect();
-        let mut color_vec = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
-        for (i, color_comp) in color_temp.iter().enumerate() {
-            color_vec[i] = color_comp.as_f64().unwrap() as f32;
+        let color_temp: Vec<_> = json["Color"].as_array().unwrap().into_iter().collect();
+        let mut color = cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0);
+        for (i, comp) in color_temp.iter().enumerate() {
+            color[i] = comp.as_f64().unwrap() as f32;
         }
 
-        // debug!("NAME: {}", name);
-        // debug!("POSITION: {}", position_vec);
-        // debug!("ROTATION: {}", rotation_vec);
-        // debug!("COLOR: {}", color_vec);
-
-        Some(Model::new(
-            name,
-            filepath,
-            device,
-            position_vec,
-            rotation_vec,
-            color_vec,
-            model_bind_group_layout,
-        ))
-    }
-
-    pub fn to_matrix(&self) -> cgmath::Matrix4<f32> {
-        let translation = cgmath::Matrix4::from_translation(self.position.to_vec());
-        let rotation = cgmath::Matrix4::from(self.rotation);
-        translation * rotation
-    }
-
-    pub fn rotate(&mut self, rotation: cgmath::Quaternion<f32>){
-        self.rotation = (self.rotation * rotation).normalize();
+        Some((Model::new(name, filepath, device, color, model_bind_group_layout), position, rotation))
     }
 }
 

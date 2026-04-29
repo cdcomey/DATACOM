@@ -3,12 +3,13 @@ use cgmath::{Point3, Vector3, Quaternion, Matrix4};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::Path;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek};
+use std::fs::OpenOptions;
+use std::sync::{Arc, Mutex};
 use log::{debug, info, error};
 use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
 use ndarray::{ArrayBase, OwnedRepr, Dim};
-use std::io::Write;
+
+use crate::ring_buffer;
 
 use wgpu::util::DeviceExt;
 
@@ -73,21 +74,21 @@ pub struct Behavior {
     pub behavior_type: BehaviorType,
     pub data: Vec<f32>,
     pub is_constant_behavior: bool,
-    data_file_path: Option<String>,
+    data_buffer: Option<ring_buffer::SharedBuffer>,
 }
 
 impl Behavior {
-    pub fn new(behavior_type: BehaviorType, data: Vec<f32>, data_file_path: Option<String>) -> Behavior {
+    pub fn new(behavior_type: BehaviorType, data: Vec<f32>, data_buffer: Option<ring_buffer::SharedBuffer>) -> Behavior {
         let is_constant_behavior = BehaviorType::is_constant_behavior(behavior_type);
-        // debug!("data in Behavior constructor of type {:?} = {:?}", behavior_type, data);
         Behavior {
             behavior_type,
             data,
             is_constant_behavior,
-            data_file_path, 
+            data_buffer,
         }
     }
-    pub fn load_from_json(json: &serde_json::Value) -> Behavior {
+
+    pub fn load_from_json(json: &serde_json::Value, registry: &ring_buffer::BufferRegistry) -> Behavior {
         let behavior_type: BehaviorType =
             BehaviorType::match_from_string(json["behaviorType"].as_str().unwrap());
         let mut data_temp: Vec<_> = json["data"]
@@ -95,15 +96,15 @@ impl Behavior {
             .unwrap()
             .into_iter()
             .collect();
-        debug!("initial behavior data length at start of function: {}", data_temp.len());
         let mut data: Vec<f32> = vec![];
-        let data_file_path = if !BehaviorType::is_constant_behavior(behavior_type) {
-            let mut path = data_temp.remove(0).to_string();
-            path = path[1..path.len()-1].to_string();
-            path.insert_str(0, "data/scene_loading/");
-            create_and_clear_file(path.as_str());
-            debug!("cropped path to {}", path);
-            Some(path)
+        let data_buffer = if !BehaviorType::is_constant_behavior(behavior_type) {
+            let raw = data_temp.remove(0).to_string();
+            let name = raw[1..raw.len()-1].to_string();
+            let buf = registry.lock().unwrap()
+                .entry(name)
+                .or_insert_with(|| Arc::new(Mutex::new(ring_buffer::RingBuffer::new())))
+                .clone();
+            Some(buf)
         } else {
             None
         };
@@ -111,9 +112,8 @@ impl Behavior {
         for data_point in data_temp.iter() {
             data.push(data_point.as_f64().unwrap() as f32);
         }
-        debug!("initial behavior data length at end of function: {}", data.len());
 
-        Behavior::new(behavior_type, data, data_file_path)
+        Behavior::new(behavior_type, data, data_buffer)
     }
 
     pub fn load_from_hdf5(data: &ArrayBase<OwnedRepr<[f32; 12]>, Dim<[usize; 1]>>) -> hdf5::Result<Behavior> {
@@ -129,64 +129,22 @@ impl Behavior {
     }
 
     fn retrieve_data_chunk(&mut self) {
-    // fn retrieve_data_chunk(behavior: &mut Behavior, target_file_path_str: &String){
-        if let Some(path_str) = &self.data_file_path {
-            let target_file_path = Path::new(path_str);
-            // let mut file = std::fs::File::create(target_file_path).unwrap();
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(target_file_path)
-                .unwrap();
-
-            let mut byte_buffer = [0; CHUNK_LENGTH as usize];
-            let num_bytes_read = file.read(&mut byte_buffer).unwrap();
-            if num_bytes_read == 0 {
-                debug!("could not find any bytes to read");
-                return;
+        if let Some(ref buf) = self.data_buffer {
+            let bytes = buf.lock().unwrap().read(CHUNK_LENGTH as usize);
+            if bytes.is_empty() { return; }
+            let num_floats = bytes.len() / F32_SIZE;
+            for i in 0..num_floats {
+                let b: [u8; F32_SIZE] = bytes[F32_SIZE*i..F32_SIZE*(i+1)].try_into().unwrap();
+                self.data.push(f32::from_be_bytes(b));
             }
-
-            debug!("byte buffer: {:?}", byte_buffer);
-            let mut float_buffer = [0.0; CHUNK_LENGTH as usize / F32_SIZE];
-            let mut i = 0usize;
-            while i < float_buffer.len() {
-                // debug!("byte buffer len = {}", byte_buffer.len());
-                // debug!("attempting to slice from {} to {}", FLOAT_SIZE*i, FLOAT_SIZE*(i+1));
-                // let bytes_raw = byte_buffer[FLOAT_SIZE*i..(FLOAT_SIZE+1)*i];
-                let bytes: [u8; F32_SIZE] = byte_buffer[F32_SIZE*i..F32_SIZE*(i+1)].try_into().unwrap();
-                float_buffer[i] = f32::from_be_bytes(bytes);
-                i += 1;
-            }
-
-            debug!("adding {:?} to entity data", &float_buffer[0..num_bytes_read / F32_SIZE]);
-            self.data.extend_from_slice(&float_buffer[0..num_bytes_read / F32_SIZE]);
-            debug!("data = {:?}", &self.data);
-
-            
-            // delete the chunk from the file
-            let temp_path = target_file_path.with_extension("tmp");
-            let mut temp_file = std::fs::File::create(&temp_path).unwrap();
-            let metadata = fs::metadata(&target_file_path).unwrap();
-            let file_len = metadata.len();
-            debug!("file length before deleting chunk: {file_len}");
-
-            file.seek(std::io::SeekFrom::Start(num_bytes_read as u64)).unwrap();
-            std::io::copy(&mut file, &mut temp_file).unwrap();
-            temp_file.sync_all().unwrap();
-            std::fs::rename(&temp_path, target_file_path).unwrap();
-            let metadata = fs::metadata(&target_file_path).unwrap();
-            let file_len = metadata.len();
-            debug!("file length after deleting chunk: {file_len}");
-
+            debug!("retrieved {} floats from ring buffer", num_floats);
         }
     }
 
     pub fn is_exhausted(&self) -> bool {
-        let file_empty = match &self.data_file_path {
-            None => true,
-            Some(path) => fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true),
-        };
-        file_empty && self.data.len() < DATA_ARR_WIDTH
+        let buffer_empty = self.data_buffer.as_ref()
+            .map_or(true, |buf| buf.lock().unwrap().is_empty());
+        buffer_empty && self.data.len() < DATA_ARR_WIDTH
     }
 }
 
@@ -196,15 +154,16 @@ pub struct Entity {
     position: Rc<RefCell<Point3<f32>>>,
     rotation: Quaternion<f32>,
     scale: Vector3<f32>,
-    models: Vec<model::Model>,
-    behaviors: Vec<Behavior>,
+    pub model: Option<model::Model>,
+    behavior: Option<Behavior>,
+    pub children: Vec<Entity>,
     trail: Vec<Point3<f32>>,
     trail_bind_group: Option<wgpu::BindGroup>,
     trail_uniform_buffer: Option<wgpu::Buffer>,
 }
 
-fn has_movement_behavior(behaviors: &[Behavior]) -> bool {
-    behaviors.iter().any(|b| matches!(b.behavior_type,
+fn has_movement_behavior(behavior: &Option<Behavior>) -> bool {
+    behavior.as_ref().map_or(false, |b| matches!(b.behavior_type,
         BehaviorType::EntityTranslate | BehaviorType::EntityChangeTransform | BehaviorType::ComponentTranslate
     ))
 }
@@ -225,146 +184,149 @@ fn create_trail_resources(device: &wgpu::Device, layout: &wgpu::BindGroupLayout)
 }
 
 impl Entity {
-    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> Entity {
-        let name = json["Name"].to_string();
-        debug!("loading entity {name}");
-
-        // Position
-        let position_temp: Vec<f32> = json["Position"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_f64().unwrap() as f32)
-            .collect();
-        let position = Point3::new(position_temp[0], position_temp[1], position_temp[2]);
-
-        // Rotation
-        let rotation_arr: Vec<f32> = json["Rotation"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_f64().unwrap() as f32)
-            .collect();
-        let rotation = Quaternion::new(rotation_arr[0], rotation_arr[1], rotation_arr[2], rotation_arr[3]);
-
-        // Scale
-        let scale_temp = json["Scale"]
-            .as_array()
-            .unwrap()
-            .into_iter();
-        let mut scale_vec = Vector3::<f32>::new(0.0, 0.0, 0.0);
-        for (i, scale_comp) in scale_temp.enumerate() {
-            scale_vec[i] = scale_comp.as_f64().unwrap() as f32;
-        }
-
-        let model_vec: Vec<_> = match json["Models"].as_array() {
-            Some(array) => {
-                let model_temp: Vec<_> = array.into_iter().collect();
-                let mut model_vec = vec![];
-                for i in model_temp.iter() {
-                    if let Some(m) = model::Model::load_from_json(*i, device, model_bind_group_layout) {
-                        model_vec.push(m);
-                    }
-                }
-                model_vec
-            }
-            None => vec![],
-        };
-
-        let behavior_vec: Vec<_> = match json["Behaviors"].as_array() {
-            Some(array) => {
-                let behavior_temp: Vec<_> = array.into_iter().collect();
-                let mut behavior_vec = vec![];
-                for i in behavior_temp.iter() {
-                    behavior_vec.push(Behavior::load_from_json(*i));
-                }
-                behavior_vec
-            }
-            None => vec![],
-        };
-
-        let (trail_uniform_buffer, trail_bind_group) = if has_movement_behavior(&behavior_vec) {
+    fn new_root(
+        name: String,
+        position: Point3<f32>,
+        rotation: Quaternion<f32>,
+        scale: Vector3<f32>,
+        behavior: Option<Behavior>,
+        children: Vec<Entity>,
+        device: &wgpu::Device,
+        model_bind_group_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let (trail_uniform_buffer, trail_bind_group) = if has_movement_behavior(&behavior) {
             let (buf, bg) = create_trail_resources(device, model_bind_group_layout);
             (Some(buf), Some(bg))
         } else {
             (None, None)
         };
-
         Entity {
-            name: name,
+            name,
             position: Rc::new(RefCell::new(position)),
             rotation,
-            scale: scale_vec,
-            models: model_vec,
-            behaviors: behavior_vec,
+            scale,
+            model: None,
+            behavior,
+            children,
             trail: Vec::new(),
             trail_bind_group,
             trail_uniform_buffer,
         }
     }
 
-    pub fn load_from_hdf5(name: String, data: hdf5::Dataset, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> hdf5::Result<Entity> {
-        // name
-        println!("NAME: {}", name);
-
-        // position
-        let data_array: ArrayBase<OwnedRepr<[f32; 12]>, Dim<[usize; 1]>>  = data.read()?;
-        let initial_transform: [f32; 12] = data_array[0];
-        let position = Point3::<f32>::new(initial_transform[0], initial_transform[1], initial_transform[2]);
-        println!("POSITION: {:?}", position);
-
-        // rotation
-        let rotation = Vector3::<f32>::new(initial_transform[7], initial_transform[6], initial_transform[8]);
-        println!("ROTATION: {:?}", rotation);
-
-        // scale
-        let scale = Vector3::<f32>::new(1.0, 1.0, 1.0);
-
-        // model vec
-        let mut name_root = name.clone();
-        if let Some(val) = name_root.find("_"){
-            name_root.truncate(val)
+    fn new_child(
+        name: String,
+        position: Point3<f32>,
+        rotation: Quaternion<f32>,
+        model: Option<model::Model>,
+        behavior: Option<Behavior>,
+    ) -> Self {
+        Entity {
+            name,
+            position: Rc::new(RefCell::new(position)),
+            rotation,
+            scale: Vector3::new(1.0, 1.0, 1.0),
+            model,
+            behavior,
+            children: Vec::new(),
+            trail: Vec::new(),
+            trail_bind_group: None,
+            trail_uniform_buffer: None,
         }
-        let name_root_str = name_root.as_str();
-        println!("NAME STR: {}", name_root_str);
-        let model_vec: Vec<_> = match name_root_str {
-            "Blizzard" => {
-                // scale = Vector3::<f32>::new(1.0, 1.0, 1.0);
-                model::Model::load_from_json_file("data/object_loading/blizzard_initialize_full.json", device, model_bind_group_layout)
-            }
-            _ => vec![],
-        };
-
-        // behavior vec
-        let behavior_vec: Vec<_> = match name_root_str {
-            "Blizzard" => {
-                // load entire data array into behavior and set type to SetPosition or similar
-                vec![Behavior::load_from_hdf5(&data_array).unwrap()]
-            }
-            _ => vec![],
-        };
-        // println!("BEHAVIOR: {:?}", behavior_vec[0].data);
-
-        // return entity
-        let (buf, bg) = create_trail_resources(device, model_bind_group_layout);
-        Ok(
-            Entity {
-                name: name,
-                position: Rc::new(RefCell::new(position)),
-                rotation: Quaternion::from_sv(1.0, rotation),
-                scale: scale,
-                models: model_vec,
-                behaviors: behavior_vec,
-                trail: Vec::new(),
-                trail_bind_group: Some(bg),
-                trail_uniform_buffer: Some(buf),
-            }
-        )
     }
 
-    // pub fn load_from_network() -> Entity {
+    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout, registry: &ring_buffer::BufferRegistry) -> Entity {
+        let name = json["Name"].to_string();
+        debug!("loading entity {name}");
 
-    // }
+        let position_arr: Vec<f32> = json["Position"].as_array().unwrap()
+            .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let position = Point3::new(position_arr[0], position_arr[1], position_arr[2]);
+
+        let rotation_arr: Vec<f32> = json["Rotation"].as_array().unwrap()
+            .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let rotation = Quaternion::new(rotation_arr[0], rotation_arr[1], rotation_arr[2], rotation_arr[3]);
+
+        let scale_arr: Vec<f32> = json["Scale"].as_array().unwrap()
+            .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+        let scale = Vector3::new(scale_arr[0], scale_arr[1], scale_arr[2]);
+
+        let entity_behavior = json["Behavior"].as_object()
+            .map(|_| Behavior::load_from_json(&json["Behavior"], registry));
+
+        let children: Vec<Entity> = match json["Children"].as_array() {
+            Some(array) => array.iter().map(|c| {
+                let child_name = c["Name"].as_str().unwrap_or("").to_string();
+
+                let child_pos_arr: Vec<f32> = c["Position"].as_array().unwrap()
+                    .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+                let child_pos = Point3::new(child_pos_arr[0], child_pos_arr[1], child_pos_arr[2]);
+
+                let child_rot_arr: Vec<f32> = c["Rotation"].as_array().unwrap()
+                    .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+                let child_rot = Quaternion::new(child_rot_arr[0], child_rot_arr[1], child_rot_arr[2], child_rot_arr[3]);
+
+                let child_model = c["ObjectFilePath"].as_str().filter(|p| !p.is_empty()).map(|raw| {
+                    let filepath = if raw.ends_with(".obj") {
+                        format!("data/object_loading/{}", raw)
+                    } else {
+                        raw.to_string()
+                    };
+                    let color_arr: Vec<f32> = c["Color"].as_array().unwrap()
+                        .iter().map(|v| v.as_f64().unwrap() as f32).collect();
+                    let color = cgmath::Vector3::new(color_arr[0], color_arr[1], color_arr[2]);
+                    model::Model::new(&child_name, &filepath, device, color, model_bind_group_layout)
+                });
+
+                let child_behavior = c["Behavior"].as_object()
+                    .map(|_| Behavior::load_from_json(&c["Behavior"], registry));
+
+                Entity::new_child(child_name, child_pos, child_rot, child_model, child_behavior)
+            }).collect(),
+            None => vec![],
+        };
+
+        Entity::new_root(name, position, rotation, scale, entity_behavior, children, device, model_bind_group_layout)
+    }
+
+    pub fn load_from_hdf5(name: String, data: hdf5::Dataset, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout) -> hdf5::Result<Entity> {
+        println!("NAME: {}", name);
+
+        let data_array: ArrayBase<OwnedRepr<[f32; 12]>, Dim<[usize; 1]>> = data.read()?;
+        let initial_transform: [f32; 12] = data_array[0];
+        let position = Point3::new(initial_transform[0], initial_transform[1], initial_transform[2]);
+        println!("POSITION: {:?}", position);
+
+        let rotation_vec = Vector3::new(initial_transform[7], initial_transform[6], initial_transform[8]);
+        println!("ROTATION: {:?}", rotation_vec);
+        let rotation = Quaternion::from_sv(
+            (1.0 - rotation_vec.magnitude2()).max(0.0).sqrt(),
+            rotation_vec,
+        );
+
+        let scale = Vector3::new(1.0, 1.0, 1.0);
+
+        let mut name_root = name.clone();
+        if let Some(val) = name_root.find('_') { name_root.truncate(val) }
+        println!("NAME STR: {}", name_root);
+
+        let children: Vec<Entity> = match name_root.as_str() {
+            "Blizzard" => {
+                model::Model::load_from_json_file("data/object_loading/blizzard_initialize_full.json", device, model_bind_group_layout)
+                    .into_iter()
+                    .map(|(m, pos, rot)| Entity::new_child(m.name.clone(), pos, rot, Some(m), None))
+                    .collect()
+            }
+            _ => vec![],
+        };
+
+        let behavior = match name_root.as_str() {
+            "Blizzard" => Some(Behavior::load_from_hdf5(&data_array).unwrap()),
+            _ => None,
+        };
+
+        Ok(Entity::new_root(name, position, rotation, scale, behavior, children, device, model_bind_group_layout))
+    }
 
     pub fn get_position(&self) -> Rc<RefCell<Point3<f32>>> { Rc::clone(&self.position) }
 
@@ -376,7 +338,7 @@ impl Entity {
             }
         }
         *self.position.borrow_mut() = new_position;
-        debug!("new entity position is {:?}", *self.position.borrow());
+        debug!("new entity transform is {:?}, {:?}, {:?}", *self.position.borrow(), self.rotation, self.scale);
     }
 
     pub fn draw_trail<'a>(
@@ -388,7 +350,8 @@ impl Entity {
         let Some(ref trail_bg) = self.trail_bind_group else { return };
         if self.trail.len() < 2 { return }
 
-        let color = self.models.first()
+        let color = self.children.first()
+            .and_then(|c| c.model.as_ref())
             .map_or([1.0f32, 1.0, 1.0], |m| [m.color.x, m.color.y, m.color.z]);
 
         let mut verts: Vec<model::ModelVertex> = Vec::with_capacity((self.trail.len() - 1) * 2);
@@ -409,26 +372,24 @@ impl Entity {
         render_pass.draw(0..verts.len() as u32, 0..1);
     }
 
-    pub fn rotate(&mut self, rotation: cgmath::Quaternion<f32>){
-        self.rotation = (self.rotation * rotation).normalize();
-    }
-
     fn to_matrix(&self) -> Matrix4<f32> {
         let translation = Matrix4::from_translation(self.position.borrow().to_vec());
         let rotation = Matrix4::from(self.rotation);
         let scale = Matrix4::from_nonuniform_scale(self.scale.x, self.scale.y, self.scale.z);
-        // let rotation_correction = Matrix4::from_angle_x(Deg(-90.0));
-        // rotation_correction * translation * rotation * scale
         translation * rotation * scale
     }
 
     pub fn find_timesteps(&self) -> Option<usize> {
-        for behavior in self.behaviors.iter() {
-            if !behavior.is_constant_behavior && behavior.data.len() > 0 {
-                return Some(behavior.data.len())
+        if let Some(ref b) = self.behavior {
+            if !b.is_constant_behavior && !b.data.is_empty() {
+                return Some(b.data.len());
             }
         }
-
+        for child in &self.children {
+            if let Some(ts) = child.find_timesteps() {
+                return Some(ts);
+            }
+        }
         None
     }
 
@@ -438,114 +399,99 @@ impl Entity {
         camera_bind_group: &'a wgpu::BindGroup,
         queue: &wgpu::Queue,
     ) {
-        let entity_matrix = self.to_matrix();
-        for model in &self.models {
-            // println!("drawing {}", model.name);
-            let model_matrix = model.to_matrix();
-            let full_transform = entity_matrix * model_matrix;
-            let full_uniform: [[f32; 4]; 4] = full_transform.into();
+        self.draw_with_parent_matrix(render_pass, camera_bind_group, queue, Matrix4::identity());
+    }
 
-            queue.write_buffer(
-                &model.uniform_buffer,
-                0,
-                bytemuck::cast_slice(&[full_uniform]),
-            );
-
+    fn draw_with_parent_matrix<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        queue: &wgpu::Queue,
+        parent_matrix: Matrix4<f32>,
+    ) {
+        let own_matrix = parent_matrix * self.to_matrix();
+        if let Some(ref model) = self.model {
+            let uniform: [[f32; 4]; 4] = own_matrix.into();
+            queue.write_buffer(&model.uniform_buffer, 0, bytemuck::cast_slice(&[uniform]));
             render_pass.draw_mesh(&model.obj, camera_bind_group, &model.bind_group);
+        }
+        for child in &self.children {
+            child.draw_with_parent_matrix(render_pass, camera_bind_group, queue, own_matrix);
         }
     }
 
-    pub fn run_behavior(&mut self, behavior_index: usize, data_counter: Option<usize>) {
-        // the borrow checker means that we have to refer to the behavior with self.behaviors[behavior_index] every time
-        let behavior = &mut self.behaviors[behavior_index];
+    fn run_own_behavior(&mut self, data_counter: Option<usize>) {
+        let Some(behavior_type) = self.behavior.as_ref().map(|b| b.behavior_type) else { return };
 
-        match behavior.behavior_type {
-            // Translate entity by vector
+        match behavior_type {
             BehaviorType::EntityTranslate => {
-                let data = &mut self.behaviors[behavior_index].data;
                 let old_position = *self.position.borrow();
-                let offset = Vector3::<f32>::new(data[0], data[1], data[2]);
+                let data = &self.behavior.as_ref().unwrap().data;
+                let offset = Vector3::new(data[0], data[1], data[2]);
                 self.set_position(old_position + offset);
             }
 
             BehaviorType::EntityRotate => {
-                // debug!("EntityRotate data = {:?}", self.behaviors[behavior_index].data);
-                let data = &mut self.behaviors[behavior_index].data;
+                let data = &self.behavior.as_ref().unwrap().data;
                 let rotation_factor = data[0];
-                let new_quaternion_vector = Vector3::<f32>::new(
-                    (rotation_factor * data[1]) as f32,
-                    (rotation_factor * data[3]) as f32,
-                    (rotation_factor * data[2]) as f32,
+                let v = Vector3::new(
+                    rotation_factor * data[1],
+                    rotation_factor * data[3],
+                    rotation_factor * data[2],
                 );
-                let new_quaternion = Quaternion::<f32>::from_sv(1.0, new_quaternion_vector);
-
-                self.rotation = (self.rotation * new_quaternion).normalize();
+                self.rotation = (self.rotation * Quaternion::from_sv(1.0, v)).normalize();
             }
 
-            // Change position to input
             BehaviorType::EntityChangeTransform => {
-                let counter = data_counter.unwrap_or(0);
+                let behavior = self.behavior.as_mut().unwrap();
                 let data_len = behavior.data.len();
-                debug!("counter = {}, data len = {}", counter, data_len);
+                debug!("data len = {}", data_len);
 
-                if data_len < (CHUNK_LENGTH as usize) * DATA_ARR_WIDTH {
-                    // self.behaviors[behavior_index].data.drain(0..counter+DATA_ARR_WIDTH);
-                    debug!("data len of {} is less than threshold of {}; attempting to retrieve data chunk", data_len, (CHUNK_LENGTH as usize) * DATA_ARR_WIDTH);
+                if data_len < CHUNK_LENGTH as usize * DATA_ARR_WIDTH {
+                    debug!("data len {} below threshold, retrieving chunk", data_len);
                     behavior.retrieve_data_chunk();
                 }
 
-                let data_len = behavior.data.len();
-
-                if data_len >= DATA_ARR_WIDTH {
-                    // let new_position = Point3::<f32>::new(behavior.data[counter], behavior.data[counter+1], behavior.data[counter+2]);
-                    // let rotation = Vector3::<f32>::new(behavior.data[counter+6], behavior.data[counter+7], behavior.data[counter+8]);
-                    debug!("reading from entity data: x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", behavior.data[0], behavior.data[1], behavior.data[2], behavior.data[6], behavior.data[7], behavior.data[8]);
-                    let new_position = Point3::<f32>::new(behavior.data[0], behavior.data[1], behavior.data[2]);
-                    let rotation = Vector3::<f32>::new(behavior.data[6], behavior.data[7], behavior.data[8]);
-                    let w = (1.0 - rotation.magnitude2()).max(0.0).sqrt();
-                    self.rotation = Quaternion::from_sv(w, rotation);
-                    // debug!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", behavior.data[0], behavior.data[1], behavior.data[2], behavior.data[6], behavior.data[7], behavior.data[8]);
-                    // info!("x: {}, y: {}, z: {}, v0: {}, v1: {}, v2: {}", new_position.x, new_position.y, new_position.z, rotation.x, rotation.y, rotation.z);
+                if behavior.data.len() >= DATA_ARR_WIDTH {
+                    debug!("reading transform: x:{} y:{} z:{} v6:{} v7:{} v8:{}",
+                        behavior.data[0], behavior.data[1], behavior.data[2],
+                        behavior.data[6], behavior.data[7], behavior.data[8]);
+                    let new_position = Point3::new(behavior.data[0], behavior.data[1], behavior.data[2]);
+                    let rot_vec = Vector3::new(behavior.data[6], behavior.data[7], behavior.data[8]);
+                    let w = (1.0 - rot_vec.magnitude2()).max(0.0).sqrt();
+                    self.rotation = Quaternion::from_sv(w, rot_vec);
                     behavior.data.drain(0..DATA_ARR_WIDTH);
-                    
                     self.set_position(new_position);
                 } else {
-                    let position = *self.position.borrow();
-                    debug!("Entity has run out of data and is stalling at last known transform: pos ({}, {}, {})", position.x, position.y, position.z);
+                    let p = *self.position.borrow();
+                    debug!("out of data, stalling at ({}, {}, {})", p.x, p.y, p.z);
                 }
-
             }
 
-            // Rotate item at constant speed
             BehaviorType::ComponentRotateConstantSpeed => {
-                // debug!("ComponentRotateConstantSpeed data = {:?}", self.behaviors[behavior_index].data);
-                let model_id = self.behaviors[behavior_index].data[0] as u64;
-                let rotation_factor = self.behaviors[behavior_index].data[1];
-                let new_quaternion_vector = Vector3::<f32>::new(
-                    (rotation_factor * self.behaviors[behavior_index].data[2]) as f32,
-                    (rotation_factor * self.behaviors[behavior_index].data[4]) as f32,
-                    (rotation_factor * self.behaviors[behavior_index].data[3]) as f32,
+                let data = &self.behavior.as_ref().unwrap().data;
+                let rotation_factor = data[0];
+                let v = Vector3::new(
+                    rotation_factor * data[1],
+                    rotation_factor * data[3],
+                    rotation_factor * data[2],
                 );
-                let new_quaternion = Quaternion::<f32>::from_sv(1.0, new_quaternion_vector);
-
-                self.get_model(model_id).rotate(new_quaternion);
+                self.rotation = (self.rotation * Quaternion::from_sv(1.0, v)).normalize();
             }
 
-            _ => return,
+            _ => {}
         }
     }
 
     pub fn run_behaviors(&mut self, data_counter: Option<usize>) {
-        for i in 0..self.behaviors.len() {
-            self.run_behavior(i, data_counter);
+        self.run_own_behavior(data_counter);
+        for child in &mut self.children {
+            child.run_own_behavior(data_counter);
         }
     }
 
     pub fn all_streams_exhausted(&self) -> bool {
-        self.behaviors.iter().all(|b| b.is_exhausted())
-    }
-
-    pub fn get_model(&mut self, model_component_id: u64) -> &mut model::Model {
-        &mut self.models[model_component_id as usize]
+        let own = self.behavior.as_ref().map_or(true, |b| b.is_exhausted());
+        own && self.children.iter().all(|c| c.all_streams_exhausted())
     }
 }

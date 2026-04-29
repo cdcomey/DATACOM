@@ -9,6 +9,8 @@ use std::thread;
 use std::fs::{self, File, OpenOptions};
 use std::time::Duration;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use crate::ring_buffer;
 use std::path::Path;
 use toml::Value;
 use log::{debug, info};
@@ -303,12 +305,13 @@ pub fn create_assembly_thread(
     rx: Receiver<Vec<u8>>,
     tx_sender: Sender<Vec<u8>>,
     tx_main: Sender<AssemblyMessage>,
+    registry: ring_buffer::BufferRegistry,
 ) -> Result<thread::JoinHandle<()>, std::io::Error> {
     let handle = thread::Builder::new().name("assembly thread".to_string()).spawn(move || {
         let mut active_files: HashMap<Uuid, FileInfo> = HashMap::new();
         let mut buf: Vec<u8> = Vec::new();
         loop {
-            if receive_file(&rx, &tx_sender, &mut active_files, &mut buf) {
+            if receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry) {
                 let _ = tx_main.send(AssemblyMessage::TransmissionComplete);
             }
         }
@@ -390,11 +393,18 @@ fn receive_file_metadata(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: 
     Some(metadata)
 }
 
+fn write_to_registry(registry: &ring_buffer::BufferRegistry, name: &str, data: &[u8]) {
+    if let Some(buf) = registry.lock().unwrap().get(name) {
+        buf.lock().unwrap().write(data);
+    }
+}
+
 fn receive_file_chunk(
-    rx: &Receiver<Vec<u8>>, 
-    buf: &mut Vec<u8>, 
-    start_time: std::time::Instant, 
-    active_files: &mut HashMap<Uuid, FileInfo>
+    rx: &Receiver<Vec<u8>>,
+    buf: &mut Vec<u8>,
+    start_time: std::time::Instant,
+    active_files: &mut HashMap<Uuid, FileInfo>,
+    registry: &ring_buffer::BufferRegistry,
 ) -> Option<Vec<u8>> {
     while buf.len() < CHUNK_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
         let Ok(msg) = rx.try_recv() else {
@@ -459,21 +469,16 @@ fn receive_file_chunk(
         debug!("L: found out-of-order chunk");
         file_data.reorder_buffer.insert(chunk_offset, payload.to_vec());
     } else if !file_data.is_definite {
-        append_to_file(file_data.name(), payload.to_vec());
+        write_to_registry(registry, &file_data.name(), payload);
         file_data.next_expected_chunk_offset += chunk_length as u64;
-        debug!("L: wrote chunk to file");
+        debug!("L: wrote chunk to ring buffer");
 
-        // TODO: clean up
         loop {
-            let first_chunk = file_data.reorder_buffer.first_key_value();
-            if let Some((offset, _)) = first_chunk {
-                if chunk_offset == *offset {
-                    let chunk = file_data.reorder_buffer.remove(&chunk_offset).unwrap();
-                    append_to_file(file_data.name(), chunk);
-                    debug!("L: wrote chunk in queue to file");
-                } else {
-                    break;
-                }
+            let next = file_data.next_expected_chunk_offset;
+            if let Some(chunk) = file_data.reorder_buffer.remove(&next) {
+                file_data.next_expected_chunk_offset += chunk.len() as u64;
+                write_to_registry(registry, &file_data.name(), &chunk);
+                debug!("L: wrote queued chunk to ring buffer");
             } else {
                 break;
             }
@@ -578,10 +583,11 @@ fn append_to_file(file_name: String, data: Vec<u8>){
 }
 
 pub fn receive_file(
-    rx_main: &Receiver<Vec<u8>>, 
+    rx_main: &Receiver<Vec<u8>>,
     tx_sender: &Sender<Vec<u8>>,
-    active_files: &mut HashMap<Uuid, FileInfo>, 
-    buf: &mut Vec<u8>
+    active_files: &mut HashMap<Uuid, FileInfo>,
+    buf: &mut Vec<u8>,
+    registry: &ring_buffer::BufferRegistry,
 ) -> bool {
     // debug!("Preparing to receive file");
     let start_time = std::time::Instant::now();
@@ -619,6 +625,11 @@ pub fn receive_file(
         MessageType::FILE_START => {
             debug!("L: received FILE_START");
             if let Some(file) = receive_file_metadata(&rx_main, buf, start_time) {
+                if !file.is_definite {
+                    registry.lock().unwrap()
+                        .entry(file.name())
+                        .or_insert_with(|| Arc::new(Mutex::new(ring_buffer::RingBuffer::new())));
+                }
                 debug!("L: adding {} to active files", file.id);
                 active_files.insert(file.id, file);
             }
@@ -626,7 +637,7 @@ pub fn receive_file(
         },
         MessageType::FILE_CHUNK => {
             debug!("L: received FILE_CHUNK");
-            let vec_opt = receive_file_chunk(&rx_main, buf, start_time, active_files);
+            let vec_opt = receive_file_chunk(&rx_main, buf, start_time, active_files, registry);
             if let Some(vec) = vec_opt {
                 info!("Requesting chunk to be retransmitted");
                 let send_result = tx_sender.send(vec);

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use cgmath::{Matrix4, Vector3};
 use wgpu::{Device, Queue, BindGroupLayout, util::DeviceExt};
 
-use crate::{model, com, text, camera, behaviors_and_entities};
+use crate::{model, com, text, camera, behaviors_and_entities, ring_buffer};
 use behaviors_and_entities::Entity;
 use model::DrawModel;
 
@@ -443,6 +443,7 @@ impl Scene {
         ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
+        registry: ring_buffer::BufferRegistry,
     ) -> Self {
         if filepath.ends_with(".hdf5") {
             Scene::load_scene_from_hdf5(
@@ -469,6 +470,7 @@ impl Scene {
                 ortho_matrix_bind_group_layout,
                 screen_width,
                 screen_height,
+                registry,
             )
         }
     }
@@ -560,7 +562,9 @@ impl Scene {
         ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
+        registry: ring_buffer::BufferRegistry,
     ) -> Scene {
+        info!("Loading {filepath}...");
         let json_unparsed = std::fs::read_to_string(filepath).unwrap();
         Scene::load_scene_from_json_str(
             json_unparsed,
@@ -573,6 +577,7 @@ impl Scene {
             ortho_matrix_bind_group_layout,
             screen_width,
             screen_height,
+            registry,
         )
     }
 
@@ -587,6 +592,7 @@ impl Scene {
         ortho_matrix_bind_group_layout: &BindGroupLayout,
         screen_width: u32,
         screen_height: u32,
+        registry: ring_buffer::BufferRegistry,
     ) -> Scene {
         let mut json: serde_json::Value = serde_json::from_str(&json_unparsed).unwrap();
         let total_timesteps = json["total_timesteps"].as_u64();
@@ -612,7 +618,7 @@ impl Scene {
             .collect();
         let mut entity_vec = vec![];
         for i in entity_temp.iter() {
-            entity_vec.push(Entity::load_from_json(*i, &device, &model_bind_group_layout));
+            entity_vec.push(Entity::load_from_json(*i, &device, &model_bind_group_layout, &registry));
         }
 
         Scene::new(
