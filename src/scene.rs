@@ -710,6 +710,7 @@ impl Scene {
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
         ortho_matrix_bind_group: &'a wgpu::BindGroup,
+        solid_render_pipeline: &'a wgpu::RenderPipeline,
         model_render_pipeline: &'a wgpu::RenderPipeline,
         lines_render_pipeline: &'a wgpu::RenderPipeline,
         rect_render_pipeline: &'a wgpu::RenderPipeline,
@@ -723,6 +724,11 @@ impl Scene {
         render_pass.set_pipeline(lines_render_pipeline);
         for entity in self.entities.iter() {
             entity.draw_trail(render_pass, camera_bind_group, &self.device);
+        }
+
+        render_pass.set_pipeline(solid_render_pipeline);
+        for entity in self.entities.iter() {
+            entity.draw(render_pass, camera_bind_group, queue);
         }
 
         render_pass.set_pipeline(model_render_pipeline);

@@ -20,11 +20,13 @@ use model::{Vertex, DrawModel};
 pub struct State<'a> {
     surface: wgpu::Surface<'a>,
     offscreen_texture: wgpu::Texture,
+    depth_texture_view: wgpu::TextureView,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    solid_render_pipeline: wgpu::RenderPipeline,
     rect_render_pipeline: wgpu::RenderPipeline,
     lines_render_pipeline: wgpu::RenderPipeline,
     text_render_pipeline: wgpu::RenderPipeline,
@@ -36,6 +38,21 @@ pub struct State<'a> {
 }
 
 impl<'a> State<'a> {
+    const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+    fn create_depth_texture(device: &wgpu::Device, size: winit::dpi::PhysicalSize<u32>) -> wgpu::TextureView {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        }).create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
     fn create_render_pipeline(
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
@@ -44,6 +61,8 @@ impl<'a> State<'a> {
         shader: wgpu::ShaderModuleDescriptor,
         topology: wgpu::PrimitiveTopology,
         polygon_mode: wgpu::PolygonMode,
+        cull_mode: Option<wgpu::Face>,
+        depth_stencil: Option<wgpu::DepthStencilState>,
     ) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(shader);
 
@@ -73,7 +92,7 @@ impl<'a> State<'a> {
                 topology: topology,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
+                cull_mode,
                 // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
                 polygon_mode: polygon_mode,
                 // Requires Features::DEPTH_CLIP_CONTROL
@@ -81,7 +100,7 @@ impl<'a> State<'a> {
                 // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil,
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -301,8 +320,59 @@ impl<'a> State<'a> {
                 shader,
                 wgpu::PrimitiveTopology::TriangleList,
                 wgpu::PolygonMode::Line,
+                None,
+                Some(wgpu::DepthStencilState {
+                    format: Self::DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
             )
         };
+
+        let solid_render_pipeline = {
+            let shader = wgpu::ShaderModuleDescriptor {
+                label: Some("Solid Shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/solid_shader.wgsl").into()),
+            };
+            State::create_render_pipeline(
+                &device,
+                &render_pipeline_layout,
+                config.format,
+                &[model::ModelVertex::desc()],
+                shader,
+                wgpu::PrimitiveTopology::TriangleList,
+                wgpu::PolygonMode::Fill,
+                Some(wgpu::Face::Back),
+                Some(wgpu::DepthStencilState {
+                    format: Self::DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 1.0,
+                        clamp: 0.0,
+                    },
+                }),
+            )
+        };
+
+        let depth_3d = Some(wgpu::DepthStencilState {
+            format: Self::DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+        let depth_ui = Some(wgpu::DepthStencilState {
+            format: Self::DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
 
         let lines_render_pipeline = {
             let shader = wgpu::ShaderModuleDescriptor {
@@ -317,6 +387,8 @@ impl<'a> State<'a> {
                 shader,
                 wgpu::PrimitiveTopology::LineList,
                 wgpu::PolygonMode::Line,
+                None,
+                depth_3d.clone(),
             )
         };
 
@@ -334,6 +406,8 @@ impl<'a> State<'a> {
                 shader,
                 wgpu::PrimitiveTopology::TriangleList,
                 wgpu::PolygonMode::Fill,
+                None,
+                depth_ui.clone(),
             )
         };
 
@@ -343,13 +417,15 @@ impl<'a> State<'a> {
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/text_shader.wgsl").into()),
             };
             State::create_render_pipeline(
-                &device, 
-                &text_render_pipeline_layout, 
-                config.format, 
-                &[GlyphVertex::desc()], 
-                shader, 
+                &device,
+                &text_render_pipeline_layout,
+                config.format,
+                &[GlyphVertex::desc()],
+                shader,
                 wgpu::PrimitiveTopology::TriangleList,
                 wgpu::PolygonMode::Fill,
+                None,
+                depth_ui,
             )
         };
 
@@ -359,26 +435,32 @@ impl<'a> State<'a> {
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain_shader.wgsl").into()),
             };
             State::create_render_pipeline(
-                &device, 
-                &terrain_render_pipeline_layout, 
-                config.format, 
-                &[ModelVertex::desc()], 
-                shader, 
-                wgpu::PrimitiveTopology::LineList, 
+                &device,
+                &terrain_render_pipeline_layout,
+                config.format,
+                &[ModelVertex::desc()],
+                shader,
+                wgpu::PrimitiveTopology::LineList,
                 wgpu::PolygonMode::Line,
+                None,
+                depth_3d,
             )
         };
-        
+
+        let depth_texture_view = Self::create_depth_texture(&device, size);
+
         surface.configure(&device, &config);
 
         Self {
             surface,
             offscreen_texture,
+            depth_texture_view,
             device,
             queue,
             config,
             size,
             render_pipeline,
+            solid_render_pipeline,
             rect_render_pipeline,
             lines_render_pipeline,
             text_render_pipeline,
@@ -398,8 +480,8 @@ impl<'a> State<'a> {
         if new_size.width > 0 && new_size.height > 0 {
             for viewport in &mut self.scene.viewports {
                 viewport.resize_from_window(
-                    new_size.width as f32, 
-                    new_size.height as f32, 
+                    new_size.width as f32,
+                    new_size.height as f32,
                     &self.queue,
                 );
             }
@@ -407,6 +489,7 @@ impl<'a> State<'a> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.depth_texture_view = Self::create_depth_texture(&self.device, new_size);
         }
     }
 
@@ -518,7 +601,14 @@ impl<'a> State<'a> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
@@ -540,6 +630,7 @@ impl<'a> State<'a> {
                     &mut render_pass,
                     &viewport.camera_bind_group,
                     &viewport.ortho_matrix_bind_group,
+                    &self.solid_render_pipeline,
                     &self.render_pipeline,
                     &self.lines_render_pipeline,
                     &self.rect_render_pipeline,
