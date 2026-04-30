@@ -36,35 +36,31 @@ pub fn create_and_clear_file(file_name: &str) {
 
 #[derive(Debug, Copy, Clone)]
 pub enum BehaviorType {
-    EntityRotate,
-    EntityTranslate,
-    EntityChangeTransform,
-    ComponentRotate,
-    ComponentTranslate,
-    ComponentRotateConstantSpeed,
-    ComponentChangeColor,
+    Rotate,
+    Translate,
+    ChangeTransform,
+    RotateConstantSpeed,
+    ChangeColor,
     Null,
 }
 
 impl BehaviorType {
     pub fn match_from_string(input_string: &str) -> BehaviorType {
         match input_string {
-            "EntityRotate" => BehaviorType::EntityRotate,
-            "EntityTranslate" => BehaviorType::EntityTranslate,
-            "EntityChangeTransform" => BehaviorType::EntityChangeTransform,
-            "ComponentRotate" => BehaviorType::ComponentRotate,
-            "ComponentTranslate" => BehaviorType::ComponentTranslate,
-            "ComponentRotateConstantSpeed" => BehaviorType::ComponentRotateConstantSpeed,
-            "ComponentChangeColor" => BehaviorType::ComponentChangeColor,
+            "Rotate" => BehaviorType::Rotate,
+            "Translate" => BehaviorType::Translate,
+            "ChangeTransform" => BehaviorType::ChangeTransform,
+            "RotateConstantSpeed" => BehaviorType::RotateConstantSpeed,
+            "ChangeColor" => BehaviorType::ChangeColor,
             _ => BehaviorType::Null,
         }
     }
 
     fn is_constant_behavior(behavior_type: BehaviorType) -> bool {
         match behavior_type {
-            BehaviorType::EntityTranslate => true,
-            BehaviorType::EntityRotate => true,
-            BehaviorType::ComponentRotateConstantSpeed => true,
+            BehaviorType::Translate => true,
+            BehaviorType::Rotate => true,
+            BehaviorType::RotateConstantSpeed => true,
             _ => false,
         }
     }
@@ -117,7 +113,7 @@ impl Behavior {
     }
 
     pub fn load_from_hdf5(data: &ArrayBase<OwnedRepr<[f32; 12]>, Dim<[usize; 1]>>) -> hdf5::Result<Behavior> {
-        let behavior_type = BehaviorType::EntityChangeTransform;
+        let behavior_type = BehaviorType::ChangeTransform;
         let a = 0;
         let b = DATA_ARR_WIDTH;
         let data_vec: Vec<f32> = data
@@ -164,7 +160,7 @@ pub struct Entity {
 
 fn has_movement_behavior(behavior: &Option<Behavior>) -> bool {
     behavior.as_ref().map_or(false, |b| matches!(b.behavior_type,
-        BehaviorType::EntityTranslate | BehaviorType::EntityChangeTransform | BehaviorType::ComponentTranslate
+        BehaviorType::Translate | BehaviorType::ChangeTransform
     ))
 }
 
@@ -424,14 +420,14 @@ impl Entity {
         let Some(behavior_type) = self.behavior.as_ref().map(|b| b.behavior_type) else { return };
 
         match behavior_type {
-            BehaviorType::EntityTranslate => {
+            BehaviorType::Translate => {
                 let old_position = *self.position.borrow();
                 let data = &self.behavior.as_ref().unwrap().data;
                 let offset = Vector3::new(data[0], data[1], data[2]);
                 self.set_position(old_position + offset);
             }
 
-            BehaviorType::EntityRotate => {
+            BehaviorType::Rotate | BehaviorType::RotateConstantSpeed => {
                 let data = &self.behavior.as_ref().unwrap().data;
                 let rotation_factor = data[0];
                 let v = Vector3::new(
@@ -442,7 +438,7 @@ impl Entity {
                 self.rotation = (self.rotation * Quaternion::from_sv(1.0, v)).normalize();
             }
 
-            BehaviorType::EntityChangeTransform => {
+            BehaviorType::ChangeTransform => {
                 let behavior = self.behavior.as_mut().unwrap();
                 let data_len = behavior.data.len();
                 debug!("data len = {}", data_len);
@@ -466,17 +462,6 @@ impl Entity {
                     let p = *self.position.borrow();
                     debug!("out of data, stalling at ({}, {}, {})", p.x, p.y, p.z);
                 }
-            }
-
-            BehaviorType::ComponentRotateConstantSpeed => {
-                let data = &self.behavior.as_ref().unwrap().data;
-                let rotation_factor = data[0];
-                let v = Vector3::new(
-                    rotation_factor * data[1],
-                    rotation_factor * data[3],
-                    rotation_factor * data[2],
-                );
-                self.rotation = (self.rotation * Quaternion::from_sv(1.0, v)).normalize();
             }
 
             _ => {}
