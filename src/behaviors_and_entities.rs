@@ -124,19 +124,6 @@ impl Behavior {
         Ok(Behavior::new(behavior_type, data_vec, None))
     }
 
-    fn retrieve_data_chunk(&mut self) {
-        if let Some(ref buf) = self.data_buffer {
-            let bytes = buf.lock().unwrap().read(CHUNK_LENGTH as usize);
-            if bytes.is_empty() { return; }
-            let num_floats = bytes.len() / F32_SIZE;
-            for i in 0..num_floats {
-                let b: [u8; F32_SIZE] = bytes[F32_SIZE*i..F32_SIZE*(i+1)].try_into().unwrap();
-                self.data.push(f32::from_be_bytes(b));
-            }
-            debug!("retrieved {} floats from ring buffer", num_floats);
-        }
-    }
-
     pub fn is_exhausted(&self) -> bool {
         let buffer_empty = self.data_buffer.as_ref()
             .map_or(true, |buf| buf.lock().unwrap().is_empty());
@@ -440,23 +427,34 @@ impl Entity {
 
             BehaviorType::ChangeTransform => {
                 let behavior = self.behavior.as_mut().unwrap();
-                let data_len = behavior.data.len();
-                debug!("data len = {}", data_len);
 
-                if data_len < CHUNK_LENGTH as usize * DATA_ARR_WIDTH {
-                    debug!("data len {} below threshold, retrieving chunk", data_len);
-                    behavior.retrieve_data_chunk();
-                }
+                let frame: Option<[f32; DATA_ARR_WIDTH]> = if let Some(ref buf) = behavior.data_buffer {
+                    let bytes = buf.lock().unwrap().read(DATA_ARR_WIDTH * F32_SIZE);
+                    if bytes.len() == DATA_ARR_WIDTH * F32_SIZE {
+                        let mut arr = [0f32; DATA_ARR_WIDTH];
+                        for i in 0..DATA_ARR_WIDTH {
+                            arr[i] = f32::from_be_bytes(bytes[i*F32_SIZE..(i+1)*F32_SIZE].try_into().unwrap());
+                        }
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                } else if behavior.data.len() >= DATA_ARR_WIDTH {
+                    let mut arr = [0f32; DATA_ARR_WIDTH];
+                    arr.copy_from_slice(&behavior.data[..DATA_ARR_WIDTH]);
+                    behavior.data.drain(0..DATA_ARR_WIDTH);
+                    Some(arr)
+                } else {
+                    None
+                };
 
-                if behavior.data.len() >= DATA_ARR_WIDTH {
+                if let Some(data) = frame {
                     debug!("reading transform: x:{} y:{} z:{} v6:{} v7:{} v8:{}",
-                        behavior.data[0], behavior.data[1], behavior.data[2],
-                        behavior.data[6], behavior.data[7], behavior.data[8]);
-                    let new_position = Point3::new(behavior.data[0], behavior.data[1], behavior.data[2]);
-                    let rot_vec = Vector3::new(behavior.data[6], behavior.data[7], behavior.data[8]);
+                        data[0], data[1], data[2], data[6], data[7], data[8]);
+                    let new_position = Point3::new(data[0], data[1], data[2]);
+                    let rot_vec = Vector3::new(data[6], data[7], data[8]);
                     let w = (1.0 - rot_vec.magnitude2()).max(0.0).sqrt();
                     self.rotation = Quaternion::from_sv(w, rot_vec);
-                    behavior.data.drain(0..DATA_ARR_WIDTH);
                     self.set_position(new_position);
                 } else {
                     let p = *self.position.borrow();
