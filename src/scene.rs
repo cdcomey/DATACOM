@@ -204,7 +204,6 @@ impl Viewport {
         // println!("resize from window called");
         // println!("new screen dims: {}, {}", screen_width, screen_height);
         if self.alignment == BorderAlignment::FullScreen {
-            self.rect.width = screen_width;
             self.rect.height = screen_height;
         }
         if self.alignment == BorderAlignment::TopRight || self.alignment == BorderAlignment::BottomRight {

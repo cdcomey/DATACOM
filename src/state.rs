@@ -614,7 +614,12 @@ impl<'a> State<'a> {
             });
 
             for viewport in self.scene.viewports.iter() {
-                // println!("viewport dims: {}, {}, {}, {}", viewport.x, viewport.y, viewport.width, viewport.height);
+                render_pass.set_scissor_rect(
+                    viewport.rect.x as u32,
+                    viewport.rect.y as u32,
+                    viewport.rect.width as u32,
+                    viewport.rect.height as u32,
+                );
                 render_pass.set_viewport(viewport.rect.x, viewport.rect.y, viewport.rect.width, viewport.rect.height, 0.0, 1.0);
 
                 viewport.draw_background_and_border(
