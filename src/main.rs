@@ -65,7 +65,7 @@ fn main() {
             pollster::block_on(run_scene_from_hdf5(args, should_save_to_file));
         } else if args[1].ends_with(".json") {
             // run json code
-            pollster::block_on(run_scene_from_json(args));
+            pollster::block_on(run_scene_from_json(args, should_save_to_file));
         } else {
             // assume user wants the scene constructed from a TCP connection
             pollster::block_on(run_scene_from_network(args, should_save_to_file));

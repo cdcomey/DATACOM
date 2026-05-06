@@ -96,11 +96,21 @@ impl Behavior {
         let data_buffer = if !BehaviorType::is_constant_behavior(behavior_type) {
             let raw = data_temp.remove(0).to_string();
             let name = raw[1..raw.len()-1].to_string();
-            let buf = registry.lock().unwrap()
-                .entry(name)
-                .or_insert_with(|| Arc::new(Mutex::new(ring_buffer::RingBuffer::new())))
-                .clone();
-            Some(buf)
+            if name.ends_with(".hdf5") {
+                let file = hdf5::File::open(&name).unwrap();
+                let dataset = file.dataset("states").unwrap();
+                let data_array: ndarray::Array2<f32> = dataset.read_2d().unwrap();
+                for row in data_array.rows() {
+                    data.extend(row.iter().copied());
+                }
+                None
+            } else {
+                let buf = registry.lock().unwrap()
+                    .entry(name)
+                    .or_insert_with(|| Arc::new(Mutex::new(ring_buffer::RingBuffer::new())))
+                    .clone();
+                Some(buf)
+            }
         } else {
             None
         };

@@ -18,7 +18,7 @@ mod text;
 mod server_test;
 
 
-pub async fn run_scene_from_json(args: Vec<String>) {
+pub async fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
     debug!("Running lib.rs::run_scene_from_json()");
 
     // let (tx, rx): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
@@ -65,6 +65,9 @@ pub async fn run_scene_from_json(args: Vec<String>) {
                             ..
                         } => {
                             debug!("Attempting to close window");
+                            if should_save_to_file {
+                                state.scene.finish_capture(state.size.width, state.size.height);
+                            }
                             control_flow.exit()
                         },
                         WindowEvent::Resized(physical_size) => {
@@ -77,9 +80,9 @@ pub async fn run_scene_from_json(args: Vec<String>) {
                             let dt = now - last_render_time;
                             last_render_time = now;
                             info!("dt = {:?}", dt);
-                            state.update(dt, false);
+                            state.update(dt, should_save_to_file);
 
-                            match state.render(false) {
+                            match state.render(should_save_to_file) {
                                 Ok(_) => {}
                                 // Reconfigure the surface if it's lost or outdated
                                 Err(

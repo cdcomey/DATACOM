@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::time::Duration;
 use std::collections::HashSet;
-use log::debug;
+use log::{info, debug};
 
 use crate::behaviors_and_entities::Entity;
 
@@ -153,6 +153,13 @@ impl CameraController {
                 if key == KeyCode::Enter {
                     self.switch_mode(scene);
                 }
+
+                if key == KeyCode::KeyC {
+                    let p = self.camera.position;
+                    let r = self.camera.rotation;
+                    println!("\"position\": [{}, {}, {}]", p.x, p.y, p.z);
+                    println!("\"rotation\": [{}, {}, {}, {}]", r.s, r.v.x, r.v.y, r.v.z);
+                }
             }
             ElementState::Released => {
                 self.pressed_keys.remove(&key);
@@ -296,7 +303,7 @@ impl CameraController {
         // }
 
         debug!("new camera position: ({}, {}, {})", self.camera.position[0], self.camera.position[1], self.camera.position[2]);
-        debug!("new camera rotation: {:?}", self.camera.rotation);
+        info!("new camera rotation: {:?}", self.camera.rotation);
     }
 
     fn update_camera_orbit(&mut self, dt: Duration){

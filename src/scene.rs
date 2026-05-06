@@ -59,6 +59,7 @@ impl Viewport {
         w: f32,
         h: f32,
         camera: camera::Camera,
+        camera_speed: f32,
         device: &Device,
         camera_bind_group_layout: &BindGroupLayout,
         ortho_matrix_bind_group_layout: &BindGroupLayout,
@@ -68,7 +69,7 @@ impl Viewport {
         let projection = camera::Projection::new(w, h, cgmath::Deg(45.0), 0.1, 100.0);
         let mut camera_uniform = camera::CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
-        let camera_controller = camera::CameraController::new(8.0, 0.4, camera);
+        let camera_controller = camera::CameraController::new(camera_speed, 0.4, camera);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -138,6 +139,7 @@ impl Viewport {
             1600.0,
             1200.0,
             camera,
+            8.0,
             device,
             camera_bind_group_layout,
             ortho_matrix_bind_group_layout,
@@ -174,6 +176,7 @@ impl Viewport {
                 let rot: cgmath::Quaternion<f32> = cgmath::Quaternion::<f32>::from_sv(s, v);
                 camera::Camera::new(pos, rot)
             },
+            json["camera"]["speed"].as_f64().unwrap_or(8.0) as f32,
             device,
             camera_bind_group_layout,
             ortho_matrix_bind_group_layout,
