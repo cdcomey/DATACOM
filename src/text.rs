@@ -65,7 +65,7 @@ pub fn load_font_atlas(path: &str, font_size: f32) -> (image::RgbaImage, HashMap
                     glyph_height as f32 / atlas.height() as f32,
                 ],
                 size: [glyph_width as f32, glyph_height as f32],
-                bearing: [bb.min.x as f32, bb.max.y as f32],
+                bearing: [bb.min.x as f32, bb.min.y as f32],
                 advance: glyph.unpositioned().h_metrics().advance_width,
             });
 
@@ -206,7 +206,7 @@ impl TextMesh {
                 let x0 = x_offset + cursor_x + glyph.bearing[0];
                 let y0 = y_offset + glyph.bearing[1];
                 let x1 = x0 + glyph.size[0];
-                let y1 = y0 - glyph.size[1];
+                let y1 = y0 + glyph.size[1];
                 // println!("INFO FOR '{}'", c);
                 // println!("x-offset = {}, y-offset = {}", x_offset, y_offset);
                 // println!("h-bearing = {}, v-bearing = {}", glyph.bearing[0], glyph.bearing[1]);
@@ -216,9 +216,9 @@ impl TextMesh {
                 let tex_coords = glyph.tex_coords;
                 // println!("tex coords: {:?}", tex_coords);
                 let u0 = tex_coords[0];
-                let v0 = tex_coords[3];
+                let v0 = tex_coords[1];
                 let u1 = tex_coords[2];
-                let v1 = 0.0;
+                let v1 = tex_coords[3];
                 vertices.push(GlyphVertex::new([x0, y0], [u0, v0], color));
                 vertices.push(GlyphVertex::new([x1, y0], [u1, v0], color));
                 vertices.push(GlyphVertex::new([x1, y1], [u1, v1], color));
