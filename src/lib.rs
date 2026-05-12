@@ -4,6 +4,7 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 use std::sync::{mpsc, Arc};
+use std::sync::atomic::AtomicBool;
 use log::{info, debug};
 use std::fs::remove_file;
 
@@ -245,16 +246,18 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
     let port_string = "data/ports.toml".to_string();
 
     if args.len() >= 4 && args[1] == "test" {
-        println!("{}, {}, {}", args[0], args[1], args[2]);
-        let server_test_result = server_test::create_server_thread(
+        let json_paths: Vec<String> = args[2..args.len()-1].to_vec();
+        let bin_path = args[args.len()-1].clone();
+        println!("test mode: {} JSON source(s), bin={}", json_paths.len(), bin_path);
+        let _server_handles = server_test::create_server_thread(
             port_string.clone(),
-            args[2].clone(),
-            args[3].clone(),
-        );
-        server_test_result.unwrap();
+            json_paths,
+            bin_path,
+        ).unwrap();
     }
 
     let registry = ring_buffer::new_registry();
+    let base_scene_written = Arc::new(AtomicBool::new(false));
 
     let (tx_assembly, rx_assembly) = mpsc::channel::<com::AssemblyMessage>();
     let streams = com::connect_to_all_tcp_streams(port_string);
@@ -267,16 +270,23 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         let listener = com::create_listener_thread(tx_listener, stream.try_clone().unwrap()).unwrap();
         listeners.push(listener);
         com::create_sender_thread(rx_sender, stream).unwrap();
-        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone(), Arc::clone(&registry)).unwrap();
+        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone(), Arc::clone(&registry), Arc::clone(&base_scene_written)).unwrap();
     }
 
     // initial file transfer
     let mut completed = 0;
+    let mut extra_scene_jsons: Vec<String> = Vec::new();
     loop {
         if listeners.iter().any(|l| l.is_finished()) { break; }
-        if matches!(rx_assembly.try_recv(), Ok(com::AssemblyMessage::TransmissionComplete)) {
-            completed += 1;
-            if completed == num_streams { break; }
+        match rx_assembly.try_recv() {
+            Ok(com::AssemblyMessage::TransmissionComplete) => {
+                completed += 1;
+                if completed == num_streams { break; }
+            }
+            Ok(com::AssemblyMessage::SceneFileAssembled(json)) => {
+                extra_scene_jsons.push(json);
+            }
+            _ => {}
         }
     }
 
@@ -295,7 +305,12 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         .unwrap();
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = state::State::new(&window, scene_file, registry).await;
+    let mut state = state::State::new(&window, scene_file, Arc::clone(&registry)).await;
+
+    for json in extra_scene_jsons {
+        state.scene.append_entities_from_json_str(&json, &registry);
+    }
+
     let mut last_render_time = std::time::Instant::now();
     let mut transmission_ended = false;
     let mut transmissions_remaining = num_streams;

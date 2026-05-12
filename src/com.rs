@@ -14,7 +14,7 @@ use crate::ring_buffer;
 use std::path::Path;
 use toml::Value;
 use log::{debug, info};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uuid::Uuid;
 
 const MESSAGE_TYPE_BYTE_WIDTH: usize = 2;
@@ -299,6 +299,7 @@ pub fn create_listener_thread<'a>(tx: Sender<Vec<u8>>, stream: TcpStream) -> Res
 
 pub enum AssemblyMessage {
     TransmissionComplete,
+    SceneFileAssembled(String),
 }
 
 pub fn create_assembly_thread(
@@ -306,12 +307,25 @@ pub fn create_assembly_thread(
     tx_sender: Sender<Vec<u8>>,
     tx_main: Sender<AssemblyMessage>,
     registry: ring_buffer::BufferRegistry,
+    base_scene_written: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, std::io::Error> {
     let handle = thread::Builder::new().name("assembly thread".to_string()).spawn(move || {
         let mut active_files: HashMap<Uuid, FileInfo> = HashMap::new();
         let mut buf: Vec<u8> = Vec::new();
         loop {
-            if receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry) {
+            let (transmission_complete, scene_file_opt) =
+                receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry);
+
+            if let Some((name, data)) = scene_file_opt {
+                if base_scene_written.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    append_to_file("main_scene.json".to_string(), data);
+                } else {
+                    let json_str = String::from_utf8(data).unwrap_or_default();
+                    let _ = tx_main.send(AssemblyMessage::SceneFileAssembled(json_str));
+                }
+            }
+
+            if transmission_complete {
                 let _ = tx_main.send(AssemblyMessage::TransmissionComplete);
             }
         }
@@ -494,10 +508,10 @@ fn receive_file_chunk(
     None
 }
 
-fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant, active_files: &mut HashMap<Uuid, FileInfo>){
+fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant, active_files: &mut HashMap<Uuid, FileInfo>) -> Option<(String, Vec<u8>)> {
     while buf.len() < FILE_END_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
         let Ok(msg) = rx.try_recv() else {
-            return
+            return None
         };
 
         buf.extend_from_slice(&msg);
@@ -509,8 +523,14 @@ fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: 
     let file_id = Uuid::from_bytes(file_id_bytes);
     let file_data = active_files.remove(&file_id).unwrap();
     let name = file_data.name();
-    append_to_file(name, file_data.data.to_vec());
     buf.drain(0..FILE_END_METADATA_BYTE_WIDTH);
+
+    if name.ends_with("_main_scene.json") {
+        Some((name, file_data.data.to_vec()))
+    } else {
+        append_to_file(name, file_data.data.to_vec());
+        None
+    }
 }
 
 fn finish_receiving_transmission(buf: &mut Vec<u8>){
@@ -588,7 +608,7 @@ pub fn receive_file(
     active_files: &mut HashMap<Uuid, FileInfo>,
     buf: &mut Vec<u8>,
     registry: &ring_buffer::BufferRegistry,
-) -> bool {
+) -> (bool, Option<(String, Vec<u8>)>) {
     // debug!("Preparing to receive file");
     let start_time = std::time::Instant::now();
 
@@ -601,7 +621,7 @@ pub fn receive_file(
     }
     while bytes_read < MESSAGE_TYPE_BYTE_WIDTH && !has_timed_out(start_time) {
         let Ok(msg) = rx_main.try_recv() else {
-            return false
+            return (false, None)
         };
 
         let msg_len = msg.len();
@@ -621,7 +641,7 @@ pub fn receive_file(
         )
     );
     
-    let transmission_over = match message_type {
+    match message_type {
         MessageType::FILE_START => {
             debug!("L: received FILE_START");
             if let Some(file) = receive_file_metadata(&rx_main, buf, start_time) {
@@ -633,7 +653,7 @@ pub fn receive_file(
                 debug!("L: adding {} to active files", file.id);
                 active_files.insert(file.id, file);
             }
-            false
+            (false, None)
         },
         MessageType::FILE_CHUNK => {
             debug!("L: received FILE_CHUNK");
@@ -645,30 +665,27 @@ pub fn receive_file(
                     debug!("Error attempting to send packet from listener to main thread: {}", e);
                 }
             }
-            false
+            (false, None)
         },
         MessageType::FILE_END => {
             debug!("L: received FILE_END");
-            finish_receiving_file(&rx_main, buf, start_time, active_files);
-            false
+            let scene_opt = finish_receiving_file(&rx_main, buf, start_time, active_files);
+            (false, scene_opt)
         },
         MessageType::REQUEST_RETRANSMIT_CHUNK => {
             debug!("L: received REQUEST_RETRANSMIT_CHUNK");
-            false
+            (false, None)
         },
         MessageType::TRANSMISSION_END => {
             debug!("L: received TRANSMISSION_END");
             finish_receiving_transmission(buf);
-            true
+            (true, None)
         }
         MessageType::ERROR => {
             debug!("L: received ERROR");
-            false
+            (false, None)
         },
-    };
-
-    // info!("L: finished processing message");
-    transmission_over
+    }
 }
 
 #[cfg(test)]

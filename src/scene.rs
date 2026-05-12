@@ -603,14 +603,14 @@ impl Scene {
         let data_counter = total_timesteps.map(|_| 0 as usize);
         let terrain = model::Terrain::new(json["terrain"].take(), &device);
 
-        let viewport_temp: Vec<_> = json["viewports"]
-            .as_array()
-            .unwrap()
-            .into_iter()
-            .collect();
         let mut viewport_vec = Vec::new();
-        for i in viewport_temp.iter() {
-            viewport_vec.push(Viewport::load_from_json(*i, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout));
+        if let Some(viewport_temp) = json["viewports"].as_array() {
+            for i in viewport_temp.iter() {
+                viewport_vec.push(Viewport::load_from_json(i, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout));
+            }
+        }
+        if viewport_vec.is_empty() {
+            viewport_vec.push(Viewport::default(&device, &camera_bind_group_layout, ortho_matrix_bind_group_layout));
         }
 
         let entity_temp: Vec<_> = json["entities"]
@@ -797,6 +797,14 @@ impl Scene {
 
     pub fn all_streams_exhausted(&self) -> bool {
         self.entities.iter().all(|e| e.all_streams_exhausted())
+    }
+
+    pub fn append_entities_from_json_str(&mut self, json_str: &str, registry: &ring_buffer::BufferRegistry) {
+        let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let Some(entity_array) = json["entities"].as_array() else { return };
+        for e in entity_array {
+            self.entities.push(Entity::load_from_json(e, &self.device, &self.model_bind_group_layout, registry));
+        }
     }
 
     pub fn finish_capture(&mut self, width: u32, height: u32) {

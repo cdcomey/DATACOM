@@ -6,18 +6,21 @@ use std::thread;
 use std::time::Duration;
 use std::io::{Read, Write};
 
+use uuid::Uuid;
+
 use crate::com::{MAX_FILE_NAME_BYTE_WIDTH, get_ports, has_timed_out};
 
 
-fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
+fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::SocketAddr){
     let full_path = format!("data/scene_loading/{}", path_str);
     let path = std::path::Path::new(&full_path);
     let test_command_data_main = fs::read_to_string(path).unwrap();
     let data_len = test_command_data_main.len();
 
     let message_type = 0u16;
-    let file_id: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-    let file_name_base = "main_scene.json";
+    let file_id = *Uuid::new_v4().as_bytes();
+    let file_name_string = format!("{}_main_scene.json", addr.port());
+    let file_name_base = file_name_string.as_str();
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
@@ -96,7 +99,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str){
 
 fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
     let message_type = 0u16;
-    let file_id: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let file_id = *Uuid::new_v4().as_bytes();
     let file_name_base = "entity_pos.bin";
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
@@ -179,51 +182,58 @@ fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
 
 pub fn create_server_thread(
     file: String,
-    json_file_path: String,
+    json_file_paths: Vec<String>,
     bin_file_path: String,
-) -> Result<thread::JoinHandle<()>, std::io::Error>{
-    let handle = thread::Builder::new().name("server thread".to_string()).spawn(move|| {
-        info!("Opened server thread");
-        let ports = get_ports(file.as_str()).unwrap();
-        let addrs_iter = &(ports[..]);
-        debug!("got addr");
-        
-        let listener = TcpListener::bind(addrs_iter).unwrap();
-        info!("Connection successful!");
-        // listener.set_nonblocking(true).unwrap();
-        let start_time = std::time::Instant::now();
+) -> Result<Vec<thread::JoinHandle<()>>, std::io::Error> {
+    let ports = get_ports(file.as_str()).unwrap();
+    info!("Spawning {} server thread(s)", json_file_paths.len());
 
-        for stream in listener.incoming() {
-            info!("received TCP stream!");
-            match stream {
-                Ok(mut stream) => {
-                    info!("TCP stream is Ok");
-                    stream.set_nodelay(true).unwrap();
-                    let mut ack = [0u8; 3];
-                    stream.read_exact(&mut ack).unwrap();
-                    if &ack == b"ACK" {
-                        info!("server thread received ACK");
-                        let stream_clone = stream.try_clone();
-                        send_finite_test_data(stream, &json_file_path);
-                        thread::sleep(Duration::from_secs(1));
-                        send_streamed_test_data(stream_clone.unwrap(), &bin_file_path);
-                    }
-                    
-                },
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    info!("TCP stream is WouldBlock");
-                    if has_timed_out(start_time) {
-                        break;
+    let mut handles = Vec::new();
+
+    for (i, json_file_path) in json_file_paths.into_iter().enumerate() {
+        let addr = ports[i];
+        let bin_path = bin_file_path.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("server thread ({})", json_file_path))
+            .spawn(move || {
+                info!("Server thread binding to {} for {}", addr, json_file_path);
+                let listener = TcpListener::bind(addr).unwrap();
+                let start_time = std::time::Instant::now();
+
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(mut stream) => {
+                            info!("Received connection on {} for {}", addr, json_file_path);
+                            stream.set_nodelay(true).unwrap();
+                            let mut ack = [0u8; 3];
+                            stream.read_exact(&mut ack).unwrap();
+                            if &ack == b"ACK" {
+                                info!("Server thread received ACK for {}", json_file_path);
+                                let stream_clone = stream.try_clone().unwrap();
+                                send_finite_test_data(stream, &json_file_path, addr);
+                                thread::sleep(Duration::from_secs(1));
+                                send_streamed_test_data(stream_clone, &bin_path);
+                            }
+                            break;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if has_timed_out(start_time) {
+                                info!("Server thread timed out for {}", json_file_path);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            info!("Server thread accept error for {}: {}", json_file_path, e);
+                            break;
+                        }
                     }
                 }
-                Err(_) => {
-                    info!("TCP stream is other Err");
-                    break
-                },
-            }
-        }
-    })
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Thread spawn failed"))?;
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Thread spawn failed"))?;
 
-    Ok(handle)
+        handles.push(handle);
+    }
+
+    Ok(handles)
 }

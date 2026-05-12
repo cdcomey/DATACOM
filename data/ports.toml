@@ -1,2 +1,2 @@
 [servers]
-"localhost" = [8081]
+"localhost" = [8081, 8082]
