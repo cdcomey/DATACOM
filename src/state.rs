@@ -307,6 +307,21 @@ impl<'a> State<'a> {
             registry,
         );
 
+        let depth_3d = Some(wgpu::DepthStencilState {
+            format: Self::DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+        let depth_ui = Some(wgpu::DepthStencilState {
+            format: Self::DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+
         let render_pipeline = {
             let shader = wgpu::ShaderModuleDescriptor {
                 label: Some("Normal Shader"),
@@ -321,13 +336,7 @@ impl<'a> State<'a> {
                 wgpu::PrimitiveTopology::TriangleList,
                 wgpu::PolygonMode::Line,
                 None,
-                Some(wgpu::DepthStencilState {
-                    format: Self::DEPTH_FORMAT,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+                depth_3d.clone(),
             )
         };
 
@@ -358,21 +367,6 @@ impl<'a> State<'a> {
                 }),
             )
         };
-
-        let depth_3d = Some(wgpu::DepthStencilState {
-            format: Self::DEPTH_FORMAT,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::LessEqual,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        });
-        let depth_ui = Some(wgpu::DepthStencilState {
-            format: Self::DEPTH_FORMAT,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        });
 
         let lines_render_pipeline = {
             let shader = wgpu::ShaderModuleDescriptor {

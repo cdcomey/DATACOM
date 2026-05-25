@@ -10,8 +10,13 @@ use uuid::Uuid;
 
 use crate::com::{MAX_FILE_NAME_BYTE_WIDTH, get_ports, has_timed_out};
 
+#[derive(Clone)]
+pub enum StreamMode {
+    File(String),
+    Generated,
+}
 
-fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::SocketAddr){
+fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::SocketAddr) {
     let full_path = format!("data/scene_loading/{}", path_str);
     let path = std::path::Path::new(&full_path);
     let test_command_data_main = fs::read_to_string(path).unwrap();
@@ -40,7 +45,7 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::
     thread::sleep(Duration::from_millis(10));
     stream.write_all(&test_command_data[..]).unwrap();
     stream.flush().unwrap();
-    
+
     let message_type = 1u16;
     let mut chunk_offset = 0u64;
     let chunk_length_default = 1024u32;
@@ -59,15 +64,14 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::
         };
 
         test_command_data.extend_from_slice(&chunk_length.to_be_bytes());
-        let max_bound = chunk_offset_usize+chunk_length as usize;
+        let max_bound = chunk_offset_usize + chunk_length as usize;
         debug!("indexing data from {} to {} out of {}", chunk_offset, max_bound, data_len);
         let payload = test_command_data_main[chunk_offset_usize..max_bound].as_bytes();
         test_command_data.extend_from_slice(payload);
         chunk_offset += chunk_length as u64;
 
         let checksum = crc32fast::hash(payload);
-        let checksum_bytes = checksum.to_be_bytes();
-        test_command_data.extend_from_slice(&checksum_bytes);
+        test_command_data.extend_from_slice(&checksum.to_be_bytes());
 
         debug!("Sending finite chunk to stream: {:?}", test_command_data);
         thread::sleep(Duration::from_millis(10));
@@ -97,93 +101,81 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::
     stream.flush().unwrap();
 }
 
-fn send_streamed_test_data(mut stream: TcpStream, path_str: &str){
-    let message_type = 0u16;
+// Sends FILE_START then streams chunks from next_chunk until it returns None,
+// then sends FILE_END and TRANSMISSION_END. For an infinite generator,
+// next_chunk never returns None so the end frames are never sent.
+fn send_streaming_data(
+    stream: &mut TcpStream,
+    file_name_base: &str,
+    is_definite: u8,
+    file_len: u32,
+    mut next_chunk: impl FnMut() -> Option<Vec<u8>>,
+) {
     let file_id = *Uuid::new_v4().as_bytes();
-    let file_name_base = "entity_pos.bin";
     let file_name_length = file_name_base.len() as u8;
     let mut file_name = [0u8; MAX_FILE_NAME_BYTE_WIDTH];
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
-    let file_len = 0u32;
 
-    let mut test_command_data: Vec<u8> = Vec::new();
-    test_command_data.extend_from_slice(&message_type.to_be_bytes());
-    test_command_data.extend_from_slice(&file_id);
-    test_command_data.extend_from_slice(&[file_name_length]);
-    test_command_data.extend_from_slice(&file_name);
-    test_command_data.extend_from_slice(&file_len.to_be_bytes());
-    test_command_data.extend_from_slice(&[0u8]);
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&file_id);
+    buf.extend_from_slice(&[file_name_length]);
+    buf.extend_from_slice(&file_name);
+    buf.extend_from_slice(&file_len.to_be_bytes());
+    buf.extend_from_slice(&[is_definite]);
 
     info!("S: Sending file start frame to stream");
-    debug!("{:?}", test_command_data);
-
+    debug!("{:?}", buf);
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&test_command_data[..]).unwrap();
+    stream.write_all(&buf).unwrap();
     stream.flush().unwrap();
 
-    let full_path = format!("data/object_loading/{}", path_str);
-    let path: &Path = std::path::Path::new(&full_path);
-    let mut file = File::open(path).unwrap();
-    let metadata = fs::metadata(path).unwrap();
-    let file_len = metadata.len();
-    debug!("src file len = {file_len}");
-
-    let message_type = 1u16;
     let mut chunk_offset = 0u64;
-    let chunk_length = 1024u32;
-    let mut buffer = vec![0u8; chunk_length as usize];
-
     loop {
-        let bytes_read = file.read(&mut buffer).unwrap();
-
-        if bytes_read == 0 {
-            debug!("no longer reading streamed file");
+        let Some(payload) = next_chunk() else {
+            debug!("chunk source exhausted");
             break;
-        }
+        };
 
-        let payload = &buffer[0..bytes_read];
-        let checksum = crc32fast::hash(payload);
+        let checksum = crc32fast::hash(&payload);
+        buf.clear();
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&file_id);
+        buf.extend_from_slice(&chunk_offset.to_be_bytes());
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&checksum.to_be_bytes());
+        chunk_offset += payload.len() as u64;
 
-        test_command_data.clear();
-        test_command_data.extend_from_slice(&message_type.to_be_bytes());
-        test_command_data.extend_from_slice(&file_id);
-        test_command_data.extend_from_slice(&chunk_offset.to_be_bytes());
-        test_command_data.extend_from_slice(&(bytes_read as u32).to_be_bytes());
-        test_command_data.extend_from_slice(&payload);
-        test_command_data.extend_from_slice(&checksum.to_be_bytes());
-        chunk_offset += bytes_read as u64;
-
-        info!("S: Sending streamed chunk to stream");
-        debug!("{:?}", test_command_data);
+        info!("S: Sending chunk to stream");
+        debug!("{:?}", buf);
         thread::sleep(Duration::from_millis(10));
-        stream.write_all(&test_command_data[..]).unwrap();
+        stream.write_all(&buf).unwrap();
         stream.flush().unwrap();
     }
 
-    let message_type = 2u16;
-    test_command_data.clear();
-    test_command_data.extend_from_slice(&message_type.to_be_bytes());
-    test_command_data.extend_from_slice(&file_id);
+    buf.clear();
+    buf.extend_from_slice(&2u16.to_be_bytes());
+    buf.extend_from_slice(&file_id);
 
     info!("S: Sending file end to stream");
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&test_command_data[..]).unwrap();
+    stream.write_all(&buf).unwrap();
     stream.flush().unwrap();
 
-    let message_type = 4u16;
-    test_command_data.clear();
-    test_command_data.extend_from_slice(&message_type.to_be_bytes());
+    buf.clear();
+    buf.extend_from_slice(&4u16.to_be_bytes());
 
     info!("S: Sending transmission end to stream");
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&test_command_data[..]).unwrap();
+    stream.write_all(&buf).unwrap();
     stream.flush().unwrap();
 }
 
 pub fn create_server_thread(
     file: String,
     json_file_paths: Vec<String>,
-    bin_file_path: String,
+    mode: StreamMode,
 ) -> Result<Vec<thread::JoinHandle<()>>, std::io::Error> {
     let ports = get_ports(file.as_str()).unwrap();
     info!("Spawning {} server thread(s)", json_file_paths.len());
@@ -192,7 +184,8 @@ pub fn create_server_thread(
 
     for (i, json_file_path) in json_file_paths.into_iter().enumerate() {
         let addr = ports[i];
-        let bin_path = bin_file_path.clone();
+        let stream_name = format!("entity_pos_{:02}", i);
+        let mode_i = mode.clone();
 
         let handle = thread::Builder::new()
             .name(format!("server thread ({})", json_file_path))
@@ -210,10 +203,51 @@ pub fn create_server_thread(
                             stream.read_exact(&mut ack).unwrap();
                             if &ack == b"ACK" {
                                 info!("Server thread received ACK for {}", json_file_path);
-                                let stream_clone = stream.try_clone().unwrap();
+                                let mut stream_clone = stream.try_clone().unwrap();
                                 send_finite_test_data(stream, &json_file_path, addr);
                                 thread::sleep(Duration::from_secs(1));
-                                send_streamed_test_data(stream_clone, &bin_path);
+
+                                match mode_i {
+                                    StreamMode::File(path) => {
+                                        let full_path = format!("data/object_loading/{}", path);
+                                        let mut file = File::open(&full_path).unwrap();
+                                        let mut buffer = vec![0u8; 1024];
+                                        send_streaming_data(&mut stream_clone, &stream_name, 0, 0, || {
+                                            let n = file.read(&mut buffer).unwrap();
+                                            if n == 0 { return None; }
+                                            Some(buffer[..n].to_vec())
+                                        });
+                                    }
+                                    StreamMode::Generated => {
+                                        use rand::Rng;
+                                        const BYTES_PER_FRAME: usize = 12 * 4;
+                                        const CHUNK_FRAMES: usize = 1;
+                                        let mut rng = rand::thread_rng();
+                                        let speed = rng.gen_range(0.02f64..0.15);
+                                        let raw = [
+                                            rng.gen_range(-1.0..1.0f64),
+                                            rng.gen_range(-1.0..1.0),
+                                            rng.gen_range(-1.0..1.0),
+                                        ];
+                                        let mag = (raw[0]*raw[0] + raw[1]*raw[1] + raw[2]*raw[2]).sqrt();
+                                        let dir = [raw[0]/mag, raw[1]/mag, raw[2]/mag];
+                                        let mut frame: u64 = 0;
+                                        send_streaming_data(&mut stream_clone, &stream_name, 0, 0, || {
+                                            let mut chunk = Vec::with_capacity(CHUNK_FRAMES * BYTES_PER_FRAME);
+                                            for _ in 0..CHUNK_FRAMES {
+                                                let t = frame as f64 * speed;
+                                                let x = (dir[0] * t) as f32;
+                                                let y = (dir[1] * t) as f32;
+                                                let z = (dir[2] * t) as f32;
+                                                for v in [x, y, z, 0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] {
+                                                    chunk.extend_from_slice(&v.to_be_bytes());
+                                                }
+                                                frame += 1;
+                                            }
+                                            Some(chunk)
+                                        });
+                                    }
+                                }
                             }
                             break;
                         }

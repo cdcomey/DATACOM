@@ -19,10 +19,8 @@ mod text;
 mod server_test;
 
 
-pub async fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
+pub fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
     debug!("Running lib.rs::run_scene_from_json()");
-
-    // let (tx, rx): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) = mpsc::channel();
 
     let event_loop = EventLoop::new().unwrap();
     let title = env!("CARGO_PKG_NAME");
@@ -36,10 +34,8 @@ pub async fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
     let scene_file = scene_file_string.as_str();
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = state::State::new(&window, scene_file, ring_buffer::new_registry()).await;
+    let mut state = pollster::block_on(state::State::new(&window, scene_file, ring_buffer::new_registry()));
     let mut last_render_time = std::time::Instant::now();
-
-    // com::create_listener_thread(tx).unwrap();
 
     event_loop
         .run(move |event, control_flow| {
@@ -115,7 +111,7 @@ pub async fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
         .unwrap();
 }
 
-pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
+pub fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
     info!("Program Start!");
 
     let event_loop = EventLoop::new().unwrap();
@@ -129,43 +125,8 @@ pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
     scene_file_string.push_str(&args[1]);
     let scene_file = scene_file_string.as_str();
 
-    let mut state = state::State::new(&window, scene_file, ring_buffer::new_registry()).await;
+    let mut state = pollster::block_on(state::State::new(&window, scene_file, ring_buffer::new_registry()));
     let mut last_render_time = std::time::Instant::now();
-
-    // State::update() calls scene.run_behaviors(), which calls entity.run_behaviors() on every entity
-    // in the JSON implementation, objects get their existence and behaviors from JSONs
-    // in this implementation, objects get their existence from the Vehicles section
-    // and their behaviors from the data below
-    /*
-        our data is divided into timesteps and data point (pos, rot)
-        we want to run state.update() every timestep
-        we want every timestep to run in time (eg timestep 1.002 should occur 1.002 seconds after starting)
-        step 1: figure out how to make a loop run every timestep
-            start = now
-            func()
-            end = now
-            sleep(timestep - (end-start))
-
-        step 2: figure out how to get each entity its data
-            lib.rs has the data
-            State->Scene->Entity
-            state.update()
-                scene.run_behaviors()
-                    entity.run_behaviors()
-            give each entity its data
-        
-        root->Vehicles->vehicle_name (eg Blizzard_0)
-
-        step 3: construct an initial scene given HDF5 info
-            lib.rs::run_scene_from_hdf5 takes in a filepath
-            runs scenes_and_entities::State::new(&window, filepath, filetype)
-            if filetype = hdf5:
-                run Scene::load_scene_from_hdf5(filepath, &device, &model_bind_group_layout)
-        
-        for entity in scene.entities:
-            entity.set_pos(scene.pos_data[entity_index][timestep])
-            
-     */
 
     event_loop
         .run(move |event, control_flow| {
@@ -235,36 +196,40 @@ pub async fn run_scene_from_hdf5(args: Vec<String>, should_save_to_file: bool) {
         .unwrap();
 }
 
-pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
+pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     debug!("Running lib.rs::run_scene_from_network()");
 
-    // TODO: change to something more generic
+    // create empty scene file
     let scene_file_string = String::from("data/scene_loading/main_scene.json");
     let scene_file = scene_file_string.as_str();
     behaviors_and_entities::create_and_clear_file(scene_file);
 
     let port_string = "data/ports.toml".to_string();
 
-    if args.len() >= 4 && args[1] == "test" {
+    // spawn server threads
+    if args.len() >= 3 && args[1] == "test" {
         let json_paths: Vec<String> = args[2..args.len()-1].to_vec();
-        let bin_path = args[args.len()-1].clone();
-        println!("test mode: {} JSON source(s), bin={}", json_paths.len(), bin_path);
+        println!("test mode: {} JSON source(s)", json_paths.len());
         let _server_handles = server_test::create_server_thread(
             port_string.clone(),
             json_paths,
-            bin_path,
+            server_test::StreamMode::Generated,
         ).unwrap();
     }
 
     let registry = ring_buffer::new_registry();
     let base_scene_written = Arc::new(AtomicBool::new(false));
 
+    // the assembly-main communication is high-level, and only needs to send an enum
+    // attempt to connect to multiple TCP streams
     let (tx_assembly, rx_assembly) = mpsc::channel::<com::AssemblyMessage>();
     let streams = com::connect_to_all_tcp_streams(port_string);
     let num_streams = streams.len();
     let mut listeners = Vec::new();
 
+    // for every successful connection, spawn a listener, sender, and assembler thread for that connection
     for stream in streams {
+        // the communication between sender, listener, and assembler is lower-level, and require byte vectors
         let (tx_listener, rx_listener) = mpsc::channel::<Vec<u8>>();
         let (tx_sender, rx_sender) = mpsc::channel::<Vec<u8>>();
         let listener = com::create_listener_thread(tx_listener, stream.try_clone().unwrap()).unwrap();
@@ -274,6 +239,7 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
     }
 
     // initial file transfer
+    // wait until all initial transmissions are complete before proceeding
     let mut completed = 0;
     let mut extra_scene_jsons: Vec<String> = Vec::new();
     loop {
@@ -295,8 +261,7 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         panic!("listener thread terminated before event loop could start");
     }
 
-    // run_scene_from_json(modified_args).await;
-
+    // create window and event loop
     let event_loop = EventLoop::new().unwrap();
     let title = env!("CARGO_PKG_NAME");
     let window = winit::window::WindowBuilder::new()
@@ -304,9 +269,13 @@ pub async fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool
         .build(&event_loop)
         .unwrap();
 
+    // create wgpu state
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = state::State::new(&window, scene_file, Arc::clone(&registry)).await;
+    let mut state = pollster::block_on(state::State::new(&window, scene_file, Arc::clone(&registry)));
 
+    // each server will be sending its own scene file, containing entities, viewports, etc
+    // we want the entities from every scene file, but only one actual scene file
+    // so we use the first received scene file, and merely add the entities from every other file into that scene
     for json in extra_scene_jsons {
         state.scene.append_entities_from_json_str(&json, &registry);
     }

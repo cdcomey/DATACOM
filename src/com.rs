@@ -67,14 +67,16 @@ impl MessageType {
     }
 }
 
+// object to be used in assembler thread's hash maps
+// stores information about a file in the middle of being transmitted across a stream
+// contains basic info, a Box for an arbitrary amount of data stored
 #[derive(Debug)]
 pub struct FileInfo {
-    message_type: MessageType,
     id: Uuid,
     name_length: u8,
     name: [u8; MAX_FILE_NAME_BYTE_WIDTH],
     is_definite: bool,
-    length: u32,
+    length: u32, // this probably isn't necessary, but it may become useful in the future
     data: Box<[u8]>,
     next_expected_chunk_offset: u64,
     reorder_buffer: BTreeMap<u64, Vec<u8>>,
@@ -84,9 +86,8 @@ impl FileInfo {
     fn new(buf: &Vec<u8>) -> Self {
         let mut counter = 0usize;
 
-        let message_type_bytes: [u8; MESSAGE_TYPE_BYTE_WIDTH] = buf[counter..counter+MESSAGE_TYPE_BYTE_WIDTH].try_into().unwrap();
-        let message_type_num: u16 = u16::from_be_bytes(message_type_bytes);
-        let message_type: MessageType = MessageType::get_from_bytes(message_type_num);
+        // we don't actually need the message type in FileInfo
+        let _: [u8; MESSAGE_TYPE_BYTE_WIDTH] = buf[counter..counter+MESSAGE_TYPE_BYTE_WIDTH].try_into().unwrap();
         counter += MESSAGE_TYPE_BYTE_WIDTH;
 
         let id_bytes: [u8; FILE_ID_BYTE_WIDTH] = buf[counter..counter+FILE_ID_BYTE_WIDTH].try_into().unwrap();
@@ -109,10 +110,9 @@ impl FileInfo {
         let is_definite_bytes: [u8; IS_DEFINITE_FILE_BYTE_WIDTH] = buf[counter..counter+IS_DEFINITE_FILE_BYTE_WIDTH].try_into().unwrap();
         let is_definite_byte = u8::from_be_bytes(is_definite_bytes);
         let is_definite = is_definite_byte != 0;
-        counter += IS_DEFINITE_FILE_BYTE_WIDTH;
+        // counter doesn't need to be incremented at this point
 
         FileInfo {
-            message_type,
             id,
             name_length,
             name,
