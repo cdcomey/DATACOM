@@ -1,8 +1,8 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::fmt;
 // use tokio;
 // use tokio::time::sleep;
-use std::net::{ToSocketAddrs, TcpStream, IpAddr, SocketAddr};
+use std::net::{ToSocketAddrs, UdpSocket, IpAddr, SocketAddr};
 // use std::error::Error;
 use std::sync::mpsc::{Sender, Receiver};
 use std::thread;
@@ -135,160 +135,62 @@ impl fmt::Display for FileInfo {
     }
 }
 
-pub fn from_network(mut stream: &TcpStream) -> Vec<u8>{
-    // debug!("Handle Commands called");
-    let mut buffer = [0; 600000];
-    match stream.read(&mut buffer){
-        Ok(bytes_read) => {
-            let packet = buffer[..bytes_read].to_vec();
-            // println!("{}",packet);
-            packet
-        },
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            panic!("Error (WouldBlock) in from_network(): {}", e)
-        },
-        Err(e) => panic!("Error in from_network(): {}", e),
-    }
-}
-
-// Rewrite me to be better
-pub fn from_network_with_protocol(stream: &mut TcpStream) -> Result<(), &str> {
-    // Get file name first, return an error if there are no more files
-    const CHUNK_SIZE: usize = 4096;
-    let mut name_buffer = [0; 400];
-    let name_bytes_read = stream.read(&mut name_buffer).unwrap();
-    let name = String::from_utf8_lossy(&name_buffer[..name_bytes_read]).to_string();
-    // debug!("Name: {}", name);
-    if name == "END" {
-        return Err("Done");
-    }
-    else {
-        // Open the file
-        // debug!("Name: {}", name);
-        let mut file = File::create(&name).unwrap();
-        
-        // Get file size next
-        let mut file_size_buffer = [0; 8];
-        stream.read_exact(&mut file_size_buffer).expect("Failed to read buffer");
-        let mut bytes_received = 0;
-        let file_size = u64::from_be_bytes(file_size_buffer);
-        // debug!("Anticipated file size: {} bytes", file_size);
-
-        
-
-        let mut buffer = [0; CHUNK_SIZE];
-        let mut num_packets_recieved = 0;
-        while bytes_received < file_size {
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            if bytes_read == 0 {
-                break;
-            }
-            file.write_all(&buffer[..bytes_read]).unwrap();
-            bytes_received += bytes_read as u64;
-            // debug!("Received packet #{}", num_packets_recieved);
-            num_packets_recieved += 1;
-        }
-        
-        // Recieve file in chunks
-        
-
-    }
-    Ok(())
-}
-
 // TODO: only public for test file; change later
 pub fn has_timed_out(start_time: std::time::Instant) -> bool {
     start_time.elapsed() >= TIMEOUT_THRESHOLD
 }
 
-fn connect_to_ip_addr(addrs: &[SocketAddr], timeout: Duration) -> std::io::Result<TcpStream> {
-    let mut last_err: Option<std::io::Error> = None;
-    for addr in addrs {
-        info!("attempting to connect to TCP stream through {addr}");
-        match TcpStream::connect_timeout(addr, timeout) {
-            Ok(stream) => {
-                info!("Connected to {}", addr);
-                return Ok(stream)
-            }
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput, "Could not connect to any valid IP address"
-        )
-    }))
-}
-
-pub fn connect_to_all_tcp_streams(file: String) -> Vec<TcpStream> {
+pub fn connect_to_all_udp_sockets(file: String) -> Vec<Arc<UdpSocket>> {
     let ports = get_ports(file.as_str()).unwrap();
-    let port_connect_timeout = Duration::from_millis(100);
 
-    ports.iter().filter_map(|addr| {
+    ports.iter().filter_map(|remote_addr| {
+        let local_addr: SocketAddr = if remote_addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
         let start_time = std::time::Instant::now();
-        while !has_timed_out(start_time) {
-            match TcpStream::connect_timeout(addr, port_connect_timeout) {
-                Ok(stream) => {
-                    info!("Connected to {}", addr);
-                    return Some(stream);
-                }
-                Err(_) => {}
+        loop {
+            if has_timed_out(start_time) {
+                info!("Timed out binding UDP socket for {}", remote_addr);
+                return None;
+            }
+            if let Ok(socket) = UdpSocket::bind(local_addr) {
+                socket.connect(remote_addr).unwrap();
+                socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+                info!("Bound UDP socket for {}", remote_addr);
+                return Some(Arc::new(socket));
             }
         }
-        info!("Timed out connecting to {}", addr);
-        None
     }).collect()
 }
 
-pub fn connect_to_tcp_stream(file: String) -> TcpStream {
-    let ports = get_ports(file.as_str()).unwrap();
-    let addrs_iter = &(ports[..]);
-    let port_connect_timeout = Duration::from_millis(100);
-    // let mut addrs_iter = "localhost:8081".to_socket_addrs().unwrap();
-    // let addr = addrs_iter.next().unwrap();
-    // thread::sleep(Duration::from_secs(1));
-
-    let start_time = std::time::Instant::now();
-    let mut stream_result = None;
-
-    while !has_timed_out(start_time) {
-        if let Ok(s) = connect_to_ip_addr(addrs_iter, port_connect_timeout) {
-            stream_result = Some(s);
-            break;
-        }
-    }
-    stream_result.unwrap()
-}
-
-pub fn create_listener_thread<'a>(tx: Sender<Vec<u8>>, stream: TcpStream) -> Result<thread::JoinHandle<()>, std::io::Error>{
-    /*
-    get addr
-    stream = TcpStream::connect(addr)
-    stream.write(ACK)
-        loop {
-            packet = from_network(stream)
-            tx.send(packet)
-        }
-
-
-     */
+pub fn create_listener_thread(tx: Sender<Vec<u8>>, socket: Arc<UdpSocket>) -> Result<thread::JoinHandle<()>, std::io::Error> {
     let handle = thread::Builder::new().name("listener thread".to_string()).spawn(move || {
-        
+        let mut buffer = vec![0u8; 65536];
         loop {
-            let packet = from_network(&stream);
-            // debug!("Packet: {}", packet);
-            // if !packet.starts_with("Error"){
-            // scene_reference.write().unwrap().bhvr_msg_str(&packet.as_str());
-            // debug!("Sending packet through tx");
-            let send_result = tx.send(packet.to_vec());
-            match send_result {
-                Ok(_) => {},
-                Err(e) => {
-                    debug!("Error attempting to send packet from listener to main thread: {}", e);
+            match socket.recv(&mut buffer) {
+                Ok(bytes_read) => {
+                    if bytes_read == 0 { continue; }
+                    let packet = buffer[..bytes_read].to_vec();
+                    let send_result = tx.send(packet);
+                    match send_result {
+                        Ok(_) => {},
+                        Err(e) => {
+                            debug!("Error attempting to send packet from listener to main thread: {}", e);
+                        }
+                    }
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                           || e.kind() == std::io::ErrorKind::TimedOut => {
+                    continue;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // ACK bounced — server not bound yet; retry
+                    let _ = socket.send(b"ACK");
+                    continue;
+                }
+                Err(e) => panic!("Error in listener thread recv(): {}", e),
             }
         }
     })
@@ -334,20 +236,23 @@ pub fn create_assembly_thread(
     Ok(handle)
 }
 
-pub fn create_sender_thread(rx: Receiver<Vec<u8>>, mut stream: TcpStream) -> Result<thread::JoinHandle<()>, std::io::Error>{
+pub fn create_sender_thread(rx: Receiver<Vec<u8>>, socket: Arc<UdpSocket>) -> Result<thread::JoinHandle<()>, std::io::Error> {
     let handle = thread::Builder::new().name("sender thread".to_string()).spawn(move || {
-        stream.write_all(b"ACK").unwrap();
-        stream.flush().unwrap();
+        socket.send(b"ACK").unwrap();
 
         loop {
             let Ok(msg) = rx.try_recv() else {
                 continue
             };
 
-            stream.write_all(&msg).unwrap();
-            stream.flush().unwrap();
-        }
+            // Drop retransmit requests — sender-side retransmit not yet implemented
+            if msg.len() >= 2 && u16::from_be_bytes([msg[0], msg[1]]) == 3 {
+                debug!("Dropping REQUEST_RETRANSMIT_CHUNK (sender retransmit not implemented)");
+                continue;
+            }
 
+            socket.send(&msg).unwrap();
+        }
     })
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Thread spawn failed"))?;
 
@@ -690,7 +595,7 @@ pub fn receive_file(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, net::{SocketAddr, TcpListener, TcpStream}, sync::mpsc, thread};
+    use std::{path::Path, net::SocketAddr, sync::mpsc, thread};
 //     use std::io::{Write, Read};
     use std::fs::{File, OpenOptions, remove_file};
 

@@ -207,6 +207,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     let port_string = "data/ports.toml".to_string();
 
     // spawn server threads
+    debug!("Spawning server threads...");
     if args.len() >= 3 && args[1] == "test" {
         let json_paths: Vec<String> = args[2..args.len()-1].to_vec();
         println!("test mode: {} JSON source(s)", json_paths.len());
@@ -221,25 +222,27 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     let base_scene_written = Arc::new(AtomicBool::new(false));
 
     // the assembly-main communication is high-level, and only needs to send an enum
-    // attempt to connect to multiple TCP streams
+    // bind UDP sockets for all configured addresses
     let (tx_assembly, rx_assembly) = mpsc::channel::<com::AssemblyMessage>();
-    let streams = com::connect_to_all_tcp_streams(port_string);
-    let num_streams = streams.len();
+    let sockets = com::connect_to_all_udp_sockets(port_string);
+    let num_streams = sockets.len();
     let mut listeners = Vec::new();
 
     // for every successful connection, spawn a listener, sender, and assembler thread for that connection
-    for stream in streams {
+    debug!("spawning client threads...");
+    for socket in sockets {
         // the communication between sender, listener, and assembler is lower-level, and require byte vectors
         let (tx_listener, rx_listener) = mpsc::channel::<Vec<u8>>();
         let (tx_sender, rx_sender) = mpsc::channel::<Vec<u8>>();
-        let listener = com::create_listener_thread(tx_listener, stream.try_clone().unwrap()).unwrap();
+        let listener = com::create_listener_thread(tx_listener, Arc::clone(&socket)).unwrap();
         listeners.push(listener);
-        com::create_sender_thread(rx_sender, stream).unwrap();
+        com::create_sender_thread(rx_sender, Arc::clone(&socket)).unwrap();
         com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone(), Arc::clone(&registry), Arc::clone(&base_scene_written)).unwrap();
     }
 
     // initial file transfer
     // wait until all initial transmissions are complete before proceeding
+    debug!("assembling initial files...");
     let mut completed = 0;
     let mut extra_scene_jsons: Vec<String> = Vec::new();
     loop {
@@ -255,6 +258,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
             _ => {}
         }
     }
+    debug!("finished assembling files!");
 
     if listeners.iter().any(|l| l.is_finished()) {
         remove_file("data/scene_loading/main_scene.json").unwrap();
@@ -271,7 +275,9 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
 
     // create wgpu state
     // State::new uses async code, so we're going to wait for it to finish
+    debug!("building State...");
     let mut state = pollster::block_on(state::State::new(&window, scene_file, Arc::clone(&registry)));
+    debug!("State finished!");
 
     // each server will be sending its own scene file, containing entities, viewports, etc
     // we want the entities from every scene file, but only one actual scene file
@@ -283,6 +289,8 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     let mut last_render_time = std::time::Instant::now();
     let mut transmission_ended = false;
     let mut transmissions_remaining = num_streams;
+    let mut force_exit = false;
+    let mut capture_saved = false;
 
     // com::create_listener_thread(tx).unwrap();
     debug!("about to start event loop");
@@ -312,7 +320,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                             ..
                         } => {
                             debug!("Attempting to close window");
-                            control_flow.exit()
+                            force_exit = true;
                         },
                         WindowEvent::Resized(physical_size) => {
                             state.resize(*physical_size);
@@ -356,7 +364,8 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                     transmission_ended = true;
                 }
             }
-            if transmission_ended && state.scene.all_streams_exhausted() {
+            if !capture_saved && (force_exit || (transmission_ended && state.scene.all_streams_exhausted())) {
+                capture_saved = true;
                 if should_save_to_file {
                     state.scene.finish_capture(state.size.width, state.size.height);
                 }

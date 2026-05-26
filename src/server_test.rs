@@ -1,10 +1,10 @@
-use std::net::{TcpStream, TcpListener};
+use std::net::{UdpSocket, SocketAddr};
 use std::fs::{self, File};
 use std::path::Path;
 use log::{debug, info};
 use std::thread;
 use std::time::Duration;
-use std::io::{Read, Write};
+use std::io::Read;
 
 use uuid::Uuid;
 
@@ -16,7 +16,7 @@ pub enum StreamMode {
     Generated,
 }
 
-fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::SocketAddr) {
+fn send_finite_test_data(socket: &UdpSocket, path_str: &str, addr: SocketAddr) {
     let full_path = format!("data/scene_loading/{}", path_str);
     let path = std::path::Path::new(&full_path);
     let test_command_data_main = fs::read_to_string(path).unwrap();
@@ -39,12 +39,11 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::
     test_command_data.extend_from_slice(&file_len.to_be_bytes());
     test_command_data.extend_from_slice(&[1u8]);
 
-    info!("Sending file start frame to stream");
+    info!("{:?}: Sending file start frame to stream", file_id);
     debug!("{:?}", test_command_data);
 
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&test_command_data[..]).unwrap();
-    stream.flush().unwrap();
+    socket.send(&test_command_data).unwrap();
 
     let message_type = 1u16;
     let mut chunk_offset = 0u64;
@@ -73,10 +72,9 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::
         let checksum = crc32fast::hash(payload);
         test_command_data.extend_from_slice(&checksum.to_be_bytes());
 
-        debug!("Sending finite chunk to stream: {:?}", test_command_data);
+        debug!("{:?}: Sending finite chunk to stream: {:?}", file_id, test_command_data);
         thread::sleep(Duration::from_millis(10));
-        stream.write_all(&test_command_data[..]).unwrap();
-        stream.flush().unwrap();
+        socket.send(&test_command_data).unwrap();
     }
 
     let message_type = 2u16;
@@ -84,28 +82,26 @@ fn send_finite_test_data(mut stream: TcpStream, path_str: &str, addr: std::net::
     test_command_data.extend_from_slice(&message_type.to_be_bytes());
     test_command_data.extend_from_slice(&file_id);
 
-    info!("Sending file end to stream");
+    info!("{:?}: Sending file end to stream", file_id);
     debug!("{:?}", test_command_data);
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&test_command_data[..]).unwrap();
-    stream.flush().unwrap();
+    socket.send(&test_command_data).unwrap();
 
     let message_type = 4u16;
     test_command_data.clear();
     test_command_data.extend_from_slice(&message_type.to_be_bytes());
 
-    info!("Sending transmission end to stream");
+    info!("{:?}: Sending transmission end to stream", file_id);
     debug!("{:?}", test_command_data);
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&test_command_data[..]).unwrap();
-    stream.flush().unwrap();
+    socket.send(&test_command_data).unwrap();
 }
 
 // Sends FILE_START then streams chunks from next_chunk until it returns None,
 // then sends FILE_END and TRANSMISSION_END. For an infinite generator,
 // next_chunk never returns None so the end frames are never sent.
 fn send_streaming_data(
-    stream: &mut TcpStream,
+    socket: &UdpSocket,
     file_name_base: &str,
     is_definite: u8,
     file_len: u32,
@@ -127,8 +123,7 @@ fn send_streaming_data(
     info!("S: Sending file start frame to stream");
     debug!("{:?}", buf);
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&buf).unwrap();
-    stream.flush().unwrap();
+    socket.send(&buf).unwrap();
 
     let mut chunk_offset = 0u64;
     loop {
@@ -150,8 +145,7 @@ fn send_streaming_data(
         info!("S: Sending chunk to stream");
         debug!("{:?}", buf);
         thread::sleep(Duration::from_millis(10));
-        stream.write_all(&buf).unwrap();
-        stream.flush().unwrap();
+        socket.send(&buf).unwrap();
     }
 
     buf.clear();
@@ -160,16 +154,14 @@ fn send_streaming_data(
 
     info!("S: Sending file end to stream");
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&buf).unwrap();
-    stream.flush().unwrap();
+    socket.send(&buf).unwrap();
 
     buf.clear();
     buf.extend_from_slice(&4u16.to_be_bytes());
 
     info!("S: Sending transmission end to stream");
     thread::sleep(Duration::from_millis(10));
-    stream.write_all(&buf).unwrap();
-    stream.flush().unwrap();
+    socket.send(&buf).unwrap();
 }
 
 pub fn create_server_thread(
@@ -190,77 +182,63 @@ pub fn create_server_thread(
         let handle = thread::Builder::new()
             .name(format!("server thread ({})", json_file_path))
             .spawn(move || {
-                info!("Server thread binding to {} for {}", addr, json_file_path);
-                let listener = TcpListener::bind(addr).unwrap();
-                let start_time = std::time::Instant::now();
+                info!("Server thread binding UDP socket to {} for {}", addr, json_file_path);
+                let socket = UdpSocket::bind(addr).unwrap();
 
-                for stream in listener.incoming() {
-                    match stream {
-                        Ok(mut stream) => {
-                            info!("Received connection on {} for {}", addr, json_file_path);
-                            stream.set_nodelay(true).unwrap();
-                            let mut ack = [0u8; 3];
-                            stream.read_exact(&mut ack).unwrap();
-                            if &ack == b"ACK" {
-                                info!("Server thread received ACK for {}", json_file_path);
-                                let mut stream_clone = stream.try_clone().unwrap();
-                                send_finite_test_data(stream, &json_file_path, addr);
-                                thread::sleep(Duration::from_secs(1));
+                // Block until the client sends its ACK datagram; learn the client address from it
+                let mut ack_buf = [0u8; 16];
+                let (_, client_addr) = match socket.recv_from(&mut ack_buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        info!("Server thread recv_from error for {}: {}", json_file_path, e);
+                        return;
+                    }
+                };
+                info!("Received ACK from {} on {} for {}", client_addr, addr, json_file_path);
+                socket.connect(client_addr).unwrap();
 
-                                match mode_i {
-                                    StreamMode::File(path) => {
-                                        let full_path = format!("data/object_loading/{}", path);
-                                        let mut file = File::open(&full_path).unwrap();
-                                        let mut buffer = vec![0u8; 1024];
-                                        send_streaming_data(&mut stream_clone, &stream_name, 0, 0, || {
-                                            let n = file.read(&mut buffer).unwrap();
-                                            if n == 0 { return None; }
-                                            Some(buffer[..n].to_vec())
-                                        });
-                                    }
-                                    StreamMode::Generated => {
-                                        use rand::Rng;
-                                        const BYTES_PER_FRAME: usize = 12 * 4;
-                                        const CHUNK_FRAMES: usize = 1;
-                                        let mut rng = rand::thread_rng();
-                                        let speed = rng.gen_range(0.02f64..0.15);
-                                        let raw = [
-                                            rng.gen_range(-1.0..1.0f64),
-                                            rng.gen_range(-1.0..1.0),
-                                            rng.gen_range(-1.0..1.0),
-                                        ];
-                                        let mag = (raw[0]*raw[0] + raw[1]*raw[1] + raw[2]*raw[2]).sqrt();
-                                        let dir = [raw[0]/mag, raw[1]/mag, raw[2]/mag];
-                                        let mut frame: u64 = 0;
-                                        send_streaming_data(&mut stream_clone, &stream_name, 0, 0, || {
-                                            let mut chunk = Vec::with_capacity(CHUNK_FRAMES * BYTES_PER_FRAME);
-                                            for _ in 0..CHUNK_FRAMES {
-                                                let t = frame as f64 * speed;
-                                                let x = (dir[0] * t) as f32;
-                                                let y = (dir[1] * t) as f32;
-                                                let z = (dir[2] * t) as f32;
-                                                for v in [x, y, z, 0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] {
-                                                    chunk.extend_from_slice(&v.to_be_bytes());
-                                                }
-                                                frame += 1;
-                                            }
-                                            Some(chunk)
-                                        });
-                                    }
+                send_finite_test_data(&socket, &json_file_path, addr);
+                thread::sleep(Duration::from_secs(1));
+
+                match mode_i {
+                    StreamMode::File(path) => {
+                        let full_path = format!("data/object_loading/{}", path);
+                        let mut file = File::open(&full_path).unwrap();
+                        let mut buffer = vec![0u8; 1024];
+                        send_streaming_data(&socket, &stream_name, 0, 0, || {
+                            let n = file.read(&mut buffer).unwrap();
+                            if n == 0 { return None; }
+                            Some(buffer[..n].to_vec())
+                        });
+                    }
+                    StreamMode::Generated => {
+                        use rand::Rng;
+                        const BYTES_PER_FRAME: usize = 12 * 4;
+                        const CHUNK_FRAMES: usize = 1;
+                        let mut rng = rand::thread_rng();
+                        let speed = rng.gen_range(0.02f64..0.15);
+                        let raw = [
+                            rng.gen_range(-1.0..1.0f64),
+                            rng.gen_range(-1.0..1.0),
+                            rng.gen_range(-1.0..1.0),
+                        ];
+                        let mag = (raw[0]*raw[0] + raw[1]*raw[1] + raw[2]*raw[2]).sqrt();
+                        let dir = [raw[0]/mag, raw[1]/mag, raw[2]/mag];
+                        let mut frame: u64 = 0;
+                        send_streaming_data(&socket, &stream_name, 0, 0, || {
+                            let mut chunk = Vec::with_capacity(CHUNK_FRAMES * BYTES_PER_FRAME);
+                            for _ in 0..CHUNK_FRAMES {
+                                let t = frame as f64 * speed;
+                                let x = (dir[0] * t) as f32;
+                                let y = (dir[1] * t) as f32;
+                                let z = (dir[2] * t) as f32;
+                                for v in [x, y, z, 0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] {
+                                    chunk.extend_from_slice(&v.to_be_bytes());
                                 }
+                                frame += 1;
                             }
-                            break;
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if has_timed_out(start_time) {
-                                info!("Server thread timed out for {}", json_file_path);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            info!("Server thread accept error for {}: {}", json_file_path, e);
-                            break;
-                        }
+                            Some(chunk)
+                        });
                     }
                 }
             })
