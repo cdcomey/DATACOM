@@ -106,7 +106,7 @@ impl GlyphVertex {
         GlyphVertex {
             position: [pos[0], pos[1], 0.0],
             uv,
-            color: [color.x, color.y, color.z, 255.0],
+            color: [color.x, color.y, color.z, 1.0],
         }
     }
 

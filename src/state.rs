@@ -63,6 +63,7 @@ impl<'a> State<'a> {
         polygon_mode: wgpu::PolygonMode,
         cull_mode: Option<wgpu::Face>,
         depth_stencil: Option<wgpu::DepthStencilState>,
+        blend: wgpu::BlendState,
     ) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(shader);
 
@@ -80,10 +81,7 @@ impl<'a> State<'a> {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: color_format,
-                    blend: Some(wgpu::BlendState {
-                        alpha: wgpu::BlendComponent::REPLACE,
-                        color: wgpu::BlendComponent::REPLACE,
-                    }),
+                    blend: Some(blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -337,6 +335,7 @@ impl<'a> State<'a> {
                 wgpu::PolygonMode::Line,
                 None,
                 depth_3d.clone(),
+                wgpu::BlendState::REPLACE,
             )
         };
 
@@ -365,6 +364,7 @@ impl<'a> State<'a> {
                         clamp: 0.0,
                     },
                 }),
+                wgpu::BlendState::REPLACE,
             )
         };
 
@@ -383,6 +383,7 @@ impl<'a> State<'a> {
                 wgpu::PolygonMode::Line,
                 None,
                 depth_3d.clone(),
+                wgpu::BlendState::REPLACE,
             )
         };
 
@@ -402,6 +403,7 @@ impl<'a> State<'a> {
                 wgpu::PolygonMode::Fill,
                 None,
                 depth_ui.clone(),
+                wgpu::BlendState::REPLACE,
             )
         };
 
@@ -420,6 +422,7 @@ impl<'a> State<'a> {
                 wgpu::PolygonMode::Fill,
                 None,
                 depth_ui,
+                wgpu::BlendState::ALPHA_BLENDING,
             )
         };
 
@@ -438,6 +441,7 @@ impl<'a> State<'a> {
                 wgpu::PolygonMode::Line,
                 None,
                 depth_3d,
+                wgpu::BlendState::REPLACE,
             )
         };
 
