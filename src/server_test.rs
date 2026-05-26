@@ -5,6 +5,7 @@ use log::{debug, info};
 use std::thread;
 use std::time::Duration;
 use std::io::Read;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -183,7 +184,7 @@ pub fn create_server_thread(
             .name(format!("server thread ({})", json_file_path))
             .spawn(move || {
                 info!("Server thread binding UDP socket to {} for {}", addr, json_file_path);
-                let socket = UdpSocket::bind(addr).unwrap();
+                let socket = Arc::new(UdpSocket::bind(addr).unwrap());
 
                 // Block until the client sends its ACK datagram; learn the client address from it
                 let mut ack_buf = [0u8; 16];
@@ -196,8 +197,36 @@ pub fn create_server_thread(
                 };
                 info!("Received ACK from {} on {} for {}", client_addr, addr, json_file_path);
                 socket.connect(client_addr).unwrap();
+                socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
 
-                send_finite_test_data(&socket, &json_file_path, addr);
+                // Listener thread: receives incoming messages from the client (e.g. retransmit
+                // requests) and logs them. Mirrors the client's create_listener_thread pattern.
+                let listener_socket = Arc::clone(&socket);
+                thread::Builder::new()
+                    .name(format!("server listener ({})", json_file_path))
+                    .spawn(move || {
+                        let mut buf = vec![0u8; 64];
+                        loop {
+                            match listener_socket.recv(&mut buf) {
+                                Ok(n) if n >= 2 && u16::from_be_bytes([buf[0], buf[1]]) == 3 => {
+                                    info!("S: received REQUEST_RETRANSMIT_CHUNK (not retransmitting)");
+                                }
+                        Ok(n) if n >= 2 && u16::from_be_bytes([buf[0], buf[1]]) == 5 => {
+                                    info!("S: received TRANSMISSION_ACK");
+                                }
+                                Ok(_) => {}
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                                           || e.kind() == std::io::ErrorKind::TimedOut => {}
+                                Err(e) => {
+                                    debug!("S: server listener ended: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .unwrap();
+
+                send_finite_test_data(&*socket, &json_file_path, addr);
                 thread::sleep(Duration::from_secs(1));
 
                 match mode_i {
@@ -205,7 +234,7 @@ pub fn create_server_thread(
                         let full_path = format!("data/object_loading/{}", path);
                         let mut file = File::open(&full_path).unwrap();
                         let mut buffer = vec![0u8; 1024];
-                        send_streaming_data(&socket, &stream_name, 0, 0, || {
+                        send_streaming_data(&*socket, &stream_name, 0, 0, || {
                             let n = file.read(&mut buffer).unwrap();
                             if n == 0 { return None; }
                             Some(buffer[..n].to_vec())
@@ -225,7 +254,7 @@ pub fn create_server_thread(
                         let mag = (raw[0]*raw[0] + raw[1]*raw[1] + raw[2]*raw[2]).sqrt();
                         let dir = [raw[0]/mag, raw[1]/mag, raw[2]/mag];
                         let mut frame: u64 = 0;
-                        send_streaming_data(&socket, &stream_name, 0, 0, || {
+                        send_streaming_data(&*socket, &stream_name, 0, 0, || {
                             let mut chunk = Vec::with_capacity(CHUNK_FRAMES * BYTES_PER_FRAME);
                             for _ in 0..CHUNK_FRAMES {
                                 let t = frame as f64 * speed;

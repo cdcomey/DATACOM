@@ -51,6 +51,7 @@ enum MessageType {
     FILE_END,
     REQUEST_RETRANSMIT_CHUNK,
     TRANSMISSION_END,
+    TRANSMISSION_ACK,
     ERROR,
 }
 
@@ -62,6 +63,7 @@ impl MessageType {
             2 => MessageType::FILE_END,
             3 => MessageType::REQUEST_RETRANSMIT_CHUNK,
             4 => MessageType::TRANSMISSION_END,
+            5 => MessageType::TRANSMISSION_ACK,
             _ => MessageType::ERROR,
         }
     }
@@ -245,12 +247,6 @@ pub fn create_sender_thread(rx: Receiver<Vec<u8>>, socket: Arc<UdpSocket>) -> Re
                 continue
             };
 
-            // Drop retransmit requests — sender-side retransmit not yet implemented
-            if msg.len() >= 2 && u16::from_be_bytes([msg[0], msg[1]]) == 3 {
-                debug!("Dropping REQUEST_RETRANSMIT_CHUNK (sender retransmit not implemented)");
-                continue;
-            }
-
             socket.send(&msg).unwrap();
         }
     })
@@ -373,7 +369,8 @@ fn receive_file_chunk(
     debug!("checking expected checksum {} against actual checksum {}", checksum_expected, checksum_actual);
     
     if checksum_expected != checksum_actual {
-        debug!("cheksum failed");
+        debug!("checksum failed");
+        buf.drain(0..CHUNK_METADATA_BYTE_WIDTH + chunk_length + CHECKSUM_WIDTH);
         let msg_type = MessageType::REQUEST_RETRANSMIT_CHUNK;
         let mut request_buf = Vec::<u8>::new();
         request_buf.extend_from_slice(&(msg_type as u16).to_be_bytes());
@@ -584,7 +581,15 @@ pub fn receive_file(
         MessageType::TRANSMISSION_END => {
             debug!("L: received TRANSMISSION_END");
             finish_receiving_transmission(buf);
+            let mut ack = Vec::new();
+            ack.extend_from_slice(&5u16.to_be_bytes());
+            let _ = tx_sender.send(ack);
             (true, None)
+        }
+        MessageType::TRANSMISSION_ACK => {
+            debug!("L: received TRANSMISSION_ACK (unexpected on client)");
+            buf.drain(0..MESSAGE_TYPE_BYTE_WIDTH);
+            (false, None)
         }
         MessageType::ERROR => {
             debug!("L: received ERROR");
