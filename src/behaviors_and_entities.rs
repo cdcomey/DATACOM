@@ -323,6 +323,8 @@ impl Entity {
 
     pub fn get_position(&self) -> Rc<RefCell<Point3<f32>>> { Rc::clone(&self.position) }
 
+    pub fn has_movement_behavior(&self) -> bool { has_movement_behavior(&self.behavior) }
+
     pub fn set_position(&mut self, new_position: Point3<f32>) {
         if self.trail_bind_group.is_some() {
             self.trail.push(*self.position.borrow());

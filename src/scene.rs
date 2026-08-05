@@ -278,6 +278,7 @@ pub struct Scene {
     frame_counter: usize,
     capture_buffers: Vec<wgpu::Buffer>,
     screen_recordings: Vec<Vec<u8>>,
+    capture_duration: std::time::Duration,
 }
 
 impl Scene {
@@ -327,6 +328,7 @@ impl Scene {
             frame_counter,
             capture_buffers,
             screen_recordings,
+            capture_duration: std::time::Duration::ZERO,
         }
     }
 
@@ -738,10 +740,10 @@ impl Scene {
             entity.draw(render_pass, camera_bind_group, queue);
         }
 
-        render_pass.set_pipeline(text_render_pipeline);
-        for text_box in self.text_boxes.iter() {
-            text_box.draw(ortho_matrix_bind_group, render_pass);
-        }
+        // render_pass.set_pipeline(text_render_pipeline);
+        // for text_box in self.text_boxes.iter() {
+        //     text_box.draw(ortho_matrix_bind_group, render_pass);
+        // }
 
         if let Some(pb) = &self.progress_bar {
             pb.draw(&self.device, render_pass, lines_render_pipeline, rect_render_pipeline, ortho_matrix_bind_group);
@@ -763,7 +765,8 @@ impl Scene {
         buffers
     }
 
-    pub fn read_and_write_capture_buffers(&mut self, device: &Device, queue: &Queue, offscreen_texture: &wgpu::Texture, width: u32, height: u32){
+    pub fn read_and_write_capture_buffers(&mut self, device: &Device, queue: &Queue, offscreen_texture: &wgpu::Texture, width: u32, height: u32, dt: std::time::Duration){
+            self.capture_duration += dt;
             let index = self.frame_counter % NUM_CAPTURE_BUFFERS;
             // read buf n
             if self.frame_counter > NUM_CAPTURE_BUFFERS {
@@ -810,8 +813,19 @@ impl Scene {
     pub fn finish_capture(&mut self, width: u32, height: u32) {
         let device = self.device.clone();
         self.read_remaining_buffers(&device, width, height);
-        println!("{} total frames recorded", self.screen_recordings.len());
-        Scene::save_screen_data_to_file(&self.screen_recordings);
+        let frame_count = self.screen_recordings.len();
+        println!("{} total frames recorded", frame_count);
+
+        // Derive the average capture framerate from wall-clock time spent recording,
+        // falling back to 60 fps if we somehow have no timing data.
+        let elapsed_secs = self.capture_duration.as_secs_f64();
+        let fps = if frame_count > 0 && elapsed_secs > 0.0 {
+            frame_count as f64 / elapsed_secs
+        } else {
+            60.0
+        };
+
+        Scene::save_screen_data_to_file(&self.screen_recordings, width, height, fps);
     }
 
     fn write_screen_to_capture_buf(device: &Device, queue: &Queue, texture: &wgpu::Texture, capture_buffers: &mut Vec<wgpu::Buffer>, width: u32, height: u32, index: usize){
@@ -886,14 +900,16 @@ impl Scene {
         }
     }
 
-    fn save_screen_data_to_file(screen_data: &Vec<Vec<u8>>){
+    fn save_screen_data_to_file(screen_data: &Vec<Vec<u8>>, width: u32, height: u32, fps: f64){
+        let size_arg = format!("{}x{}", width, height);
+        let rate_arg = format!("{:.3}", fps);
 
         let mut ffmpeg_process = Command::new("ffmpeg")
             .args(&[
                 "-f", "rawvideo", //    input is raw video pixels
                 "-pix_fmt", "bgra", //  BGRA format (wgpu surface on macOS is Bgra8Unorm)
-                "-s", "1600x1200", //   dimensions
-                "-r", "60", //          fps
+                "-s", &size_arg, //     dimensions (actual capture resolution)
+                "-r", &rate_arg, //     fps (measured average capture framerate)
                 "-i", "pipe:0", //      read input from stdin
                 "-c:v", "libx264", //   specify video codex
                 "-pix_fmt", "yuv420p",

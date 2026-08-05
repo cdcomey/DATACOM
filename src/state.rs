@@ -559,7 +559,8 @@ impl<'a> State<'a> {
                 &self.queue,
                 &self.offscreen_texture,
                 self.size.width,
-                self.size.height
+                self.size.height,
+                dt
             );
         }
     }

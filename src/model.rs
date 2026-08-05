@@ -1,6 +1,6 @@
 use serde_derive::Deserialize;
 use wgpu::util::DeviceExt;
-use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
+use cgmath::{SquareMatrix};
 use crate::camera;
 use log::debug;
 

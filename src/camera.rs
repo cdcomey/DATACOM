@@ -228,10 +228,9 @@ impl CameraController {
         match self.mode {
             CameraMode::FreeRoam => {
                 self.mode = CameraMode::OrbitPoint;
-                self.point_of_focus = Some(scene[0].get_position());
-                let point_option = self.point_of_focus.as_ref().map(|rc| rc.borrow());
-                let point = *point_option.expect("Error: camera is attempting to orbit a point that does not exist");
-                self.radius = Some((self.camera.position - point).magnitude());
+                let target = scene.iter().find(|e| e.has_movement_behavior()).unwrap_or(&scene[0]);
+                self.point_of_focus = Some(target.get_position());
+                self.radius = Some(5.0);
                 self.h_angle = Some(Rad(PI));
                 self.v_angle = Some(Rad(0.0));
                 
