@@ -7,5 +7,9 @@
 tmp.py
 data/scene_loading/test_data/*
 data/object_loading/test_data/*
+data/test_commands/*
 .DS_Store
 Cargo.lock
+*.gif
+*.pages
+*.bin
