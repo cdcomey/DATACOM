@@ -267,6 +267,69 @@ impl TextMesh {
     }
 }
 
+/// Font atlas, sampler and bind group layout shared by every `TextDisplay`.
+///
+/// `load_font_atlas` reads and rasterizes a TTF (and writes `atlas_example.png`), so it must
+/// run once per scene rather than once per text box. Holding these lets text be created at
+/// runtime — which is what toasts need.
+pub struct TextResources {
+    glyph_map: Arc<HashMap<char, Glyph>>,
+    texture_atlas: wgpu::Texture,
+    atlas_sampler: wgpu::Sampler,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl TextResources {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: &wgpu::TextureFormat,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        font_size: f32,
+    ) -> Self {
+        let (image_atlas, glyph_map) = load_font_atlas(&get_font(), font_size);
+        let texture_atlas = create_texture_atlas(device, queue, format, image_atlas);
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        TextResources {
+            glyph_map: Arc::new(glyph_map),
+            texture_atlas,
+            atlas_sampler,
+            bind_group_layout: bind_group_layout.clone(),
+        }
+    }
+
+    /// Builds a new text box from the shared atlas.
+    pub fn make_display(
+        &self,
+        device: &wgpu::Device,
+        content: String,
+        x_start: f32,
+        y_start: f32,
+        color: cgmath::Vector3<f32>,
+    ) -> TextDisplay {
+        TextDisplay::new(
+            content,
+            Arc::clone(&self.glyph_map),
+            x_start,
+            y_start,
+            color,
+            device,
+            &self.texture_atlas,
+            &self.atlas_sampler,
+            &self.bind_group_layout,
+        )
+    }
+}
+
 // Struct for DATACOM to display text.
 pub struct TextDisplay {
     content: String,
@@ -276,6 +339,8 @@ pub struct TextDisplay {
     y_start: f32,
     color: cgmath::Vector3<f32>,
     bind_group: wgpu::BindGroup,
+    fade_buffer: wgpu::Buffer,
+    alpha: f32,
 }
 
 impl TextDisplay {
@@ -294,6 +359,12 @@ impl TextDisplay {
 
         let texture_atlas_view = texture_atlas.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let fade_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Text Fade Buffer"),
+            contents: bytemuck::cast_slice(&Self::fade_uniform(1.0)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let text_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("TextDisplay Bind Group"),
             layout: bind_group_layout,
@@ -306,6 +377,10 @@ impl TextDisplay {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&atlas_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fade_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -317,7 +392,27 @@ impl TextDisplay {
             color,
             mesh,
             bind_group: text_bind_group,
+            fade_buffer,
+            alpha: 1.0,
         }
+    }
+
+    /// Matches the `vec4<f32>` the fragment shader binds; only the first lane is read.
+    fn fade_uniform(alpha: f32) -> [f32; 4] {
+        [alpha, 0.0, 0.0, 0.0]
+    }
+
+    /// Sets the opacity of the whole text box: 1.0 opaque, 0.0 invisible.
+    ///
+    /// This only rewrites a 16-byte uniform, so it is cheap enough to call every frame —
+    /// unlike `change_text`, which rebuilds the vertex and index buffers.
+    pub fn set_alpha(&mut self, queue: &wgpu::Queue, alpha: f32) {
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha == self.alpha {
+            return;
+        }
+        self.alpha = alpha;
+        queue.write_buffer(&self.fade_buffer, 0, bytemuck::cast_slice(&Self::fade_uniform(alpha)));
     }
 
     /// Function to change text in string.
@@ -332,6 +427,59 @@ impl TextDisplay {
         render_pass: &mut wgpu::RenderPass<'a>,
     ) {
         render_pass.draw_text(&self, ortho_matrix_bind_group, &self.bind_group);
+    }
+}
+
+/// A transient text box: fully opaque for `hold`, then fading linearly to nothing over
+/// `fade`, after which it is dropped.
+pub struct Toast {
+    display: TextDisplay,
+    elapsed: std::time::Duration,
+    hold: std::time::Duration,
+    fade: std::time::Duration,
+}
+
+impl Toast {
+    pub const DEFAULT_HOLD: std::time::Duration = std::time::Duration::from_millis(1000);
+    pub const DEFAULT_FADE: std::time::Duration = std::time::Duration::from_millis(400);
+
+    pub fn new(display: TextDisplay, hold: std::time::Duration, fade: std::time::Duration) -> Self {
+        Toast {
+            display,
+            elapsed: std::time::Duration::ZERO,
+            hold,
+            fade,
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        // None while still inside the hold window.
+        let Some(into_fade) = self.elapsed.checked_sub(self.hold) else {
+            return 1.0;
+        };
+
+        if self.fade.is_zero() || into_fade >= self.fade {
+            return 0.0;
+        }
+
+        1.0 - into_fade.as_secs_f32() / self.fade.as_secs_f32()
+    }
+
+    /// Advances the timer and pushes the new opacity to the GPU. Returns false once the
+    /// toast has fully faded, meaning the caller should drop it.
+    pub fn update(&mut self, queue: &wgpu::Queue, dt: std::time::Duration) -> bool {
+        self.elapsed += dt;
+        let alpha = self.alpha();
+        self.display.set_alpha(queue, alpha);
+        alpha > 0.0
+    }
+
+    pub fn draw<'a>(
+        &'a self,
+        ortho_matrix_bind_group: &'a wgpu::BindGroup,
+        render_pass: &mut wgpu::RenderPass<'a>,
+    ) {
+        self.display.draw(ortho_matrix_bind_group, render_pass);
     }
 }
 

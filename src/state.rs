@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use winit::{
     event::*,
-    keyboard::PhysicalKey,
+    keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
 use wgpu::TextureUsages;
@@ -259,6 +259,17 @@ impl<'a> State<'a> {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Per-TextDisplay fade alpha, rewritten each frame while a toast fades out.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
             label: Some("Text Bind Group Layout"),
         });
@@ -508,6 +519,20 @@ impl<'a> State<'a> {
     
     pub fn window_input(&mut self, event: &WindowEvent) -> bool {
         match event {
+            // Must precede the general keyboard arm below, which forwards everything to the camera.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyT),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                self.scene.show_toast(format!("{:.1} FPS", self.framerate));
+                true
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -550,6 +575,8 @@ impl<'a> State<'a> {
         let fr_str = format!("{:.1} fps", self.framerate);
         self.scene.text_boxes[0].change_text(&self.device, fr_str);
 
+
+        self.scene.update_toasts(dt);
 
         self.scene.run_behaviors();
 

@@ -15,6 +15,12 @@ use model::DrawModel;
 const BYTES_PER_PIXEL: u32 = 4;
 const NUM_CAPTURE_BUFFERS: usize = 3;
 
+/// Pixel height the glyph atlas is rasterized at.
+const FONT_SIZE: f32 = 100.0;
+/// Viewport-local baseline position for toasts, below the FPS counter at (30, 100).
+const TOAST_X: f32 = 30.0;
+const TOAST_Y: f32 = 220.0;
+
 #[derive(PartialEq)]
 enum BorderAlignment {
     Free,
@@ -266,6 +272,8 @@ pub struct Scene {
     pub entities: Vec<Entity>,
     pub terrain: model::Terrain,
     pub text_boxes: Vec<text::TextDisplay>,
+    text_resources: text::TextResources,
+    toasts: Vec<text::Toast>,
     pub viewports: Vec<Viewport>,
     pub device: std::sync::Arc<Device>,
     pub queue: std::sync::Arc<Queue>,
@@ -299,7 +307,8 @@ impl Scene {
         screen_height: u32,
     ) -> Self {
         let axes = model::Axes::new(&device);
-        let text_boxes = Scene::init_text_boxes(&device, &queue, format, text_bind_group_layout, 60.0);
+        let text_resources = text::TextResources::new(&device, &queue, format, text_bind_group_layout, FONT_SIZE);
+        let text_boxes = Scene::init_text_boxes(&device, &text_resources, 60.0);
         let frame_counter: usize = 0;
         let capture_buffers = Scene::init_capture_buffers(
             &device,
@@ -316,6 +325,8 @@ impl Scene {
             entities,
             terrain,
             text_boxes,
+            text_resources,
+            toasts: Vec::new(),
             viewports,
             device,
             queue,
@@ -333,45 +344,47 @@ impl Scene {
     }
 
     fn init_text_boxes(
-        device: &Device, 
-        queue: &Queue,
-        format: &wgpu::TextureFormat,
-        text_bind_group_layout: &BindGroupLayout, 
+        device: &Device,
+        text_resources: &text::TextResources,
         framerate: f32,
     ) -> Vec<TextDisplay> {
-        let (image_atlas, glyph_map) = text::load_font_atlas(&text::get_font(), 100.0);
-        let glyph_map = Arc::new(glyph_map);
-        let texture_atlas = Arc::new(text::create_texture_atlas(device, queue, format, image_atlas));
-        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
         let text_objects: Vec<TextDisplay> = vec![
-            TextDisplay::new(
-                framerate.to_string(), 
-                glyph_map.clone(), 
-                30.0, 
-                100.0, 
-                cgmath::Vector3::new(0.0, 255.0, 0.0),
+            text_resources.make_display(
                 device,
-                &texture_atlas,
-                &atlas_sampler,
-                text_bind_group_layout,
+                framerate.to_string(),
+                30.0,
+                100.0,
+                cgmath::Vector3::new(0.0, 255.0, 0.0),
             )
         ];
 
-        // TextDisplay::new("Hello World!".to_string(), glyph_map.clone(), texture_atlas.clone(), 0.0, 0.0, green_vec()),
-        // TextDisplay::new("DATACOM VER 0.1.0".to_string(), glyph_map.clone(), texture_atlas.clone(), -1.0, 0.90, green_vec()),
-        // TextDisplay::new((' '..='~').collect(), glyph_map.clone(), texture_atlas.clone(), -1.0, -1.0, green_vec()),
-        // TextDisplay::new("FPS Counter: 0.0".to_string(), glyph_map.clone(), texture_atlas.clone(), 0.6, 0.9, cyan_vec()),
-
         text_objects
+    }
+
+    /// Shows a message that holds at full opacity for a second, then fades out quickly.
+    ///
+    /// Toasts are positioned in viewport-local coordinates, so one call draws the same
+    /// message in every viewport.
+    pub fn show_toast(&mut self, content: String) {
+        let display = self.text_resources.make_display(
+            &self.device,
+            content,
+            TOAST_X,
+            TOAST_Y,
+            cgmath::Vector3::new(0.0, 255.0, 255.0),
+        );
+
+        self.toasts.push(text::Toast::new(
+            display,
+            text::Toast::DEFAULT_HOLD,
+            text::Toast::DEFAULT_FADE,
+        ));
+    }
+
+    /// Advances every toast's fade and drops the ones that have finished.
+    pub fn update_toasts(&mut self, dt: std::time::Duration) {
+        let queue = Arc::clone(&self.queue);
+        self.toasts.retain_mut(|toast| toast.update(&queue, dt));
     }
 
     pub fn run_behaviors(&mut self) {
@@ -747,6 +760,12 @@ impl Scene {
 
         if let Some(pb) = &self.progress_bar {
             pb.draw(&self.device, render_pass, lines_render_pipeline, rect_render_pipeline, ortho_matrix_bind_group);
+        }
+
+        // Drawn last so toasts sit on top of everything else in the viewport.
+        render_pass.set_pipeline(text_render_pipeline);
+        for toast in self.toasts.iter() {
+            toast.draw(ortho_matrix_bind_group, render_pass);
         }
     }
 

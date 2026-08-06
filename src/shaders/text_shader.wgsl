@@ -16,6 +16,10 @@ struct VertexOutput {
 @group(1) @binding(0) var glyph_tex: texture_2d<f32>;
 @group(1) @binding(1) var glyph_sampler: sampler;
 
+// Per-TextDisplay fade. Only .x is read (the alpha multiplier, 1.0 = opaque);
+// it is a vec4 because uniforms must be 16-byte aligned.
+@group(1) @binding(2) var<uniform> fade: vec4<f32>;
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
@@ -28,5 +32,9 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sample = textureSample(glyph_tex, glyph_sampler, in.v_uv);
-    return in.v_color * sample;
+    var color = in.v_color * sample;
+    // Straight (non-premultiplied) alpha: the blend state scales rgb by src alpha,
+    // so scaling only .a here fades the glyph without darkening it.
+    color.a = color.a * fade.x;
+    return color;
 }
