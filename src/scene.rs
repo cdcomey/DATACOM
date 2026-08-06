@@ -802,12 +802,15 @@ impl Scene {
         self.entities.iter().all(|e| e.all_streams_exhausted())
     }
 
-    pub fn append_entities_from_json_str(&mut self, json_str: &str, registry: &ring_buffer::BufferRegistry) {
+    // returns how many entities were merged in, so callers can report whether a stream that
+    // connected actually contributed anything to the scene
+    pub fn append_entities_from_json_str(&mut self, json_str: &str, registry: &ring_buffer::BufferRegistry) -> usize {
         let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        let Some(entity_array) = json["entities"].as_array() else { return };
+        let Some(entity_array) = json["entities"].as_array() else { return 0 };
         for e in entity_array {
             self.entities.push(Entity::load_from_json(e, &self.device, &self.model_bind_group_layout, registry));
         }
+        entity_array.len()
     }
 
     pub fn finish_capture(&mut self, width: u32, height: u32) {

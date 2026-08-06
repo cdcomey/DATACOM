@@ -41,6 +41,17 @@ const CHECKSUM_WIDTH: usize = 4;
 const SECONDS_UNTIL_TIMEOUT: u64 = 30;
 const TIMEOUT_THRESHOLD: Duration = Duration::from_secs(SECONDS_UNTIL_TIMEOUT);
 const MAX_CHUNK_TRANSMIT_ATTEMPTS: u8 = 5;
+
+// ports.toml lists the servers we *may* connect to, not the ones that necessarily exist, and a
+// drone can come online at any point in a session. Unanswered ports therefore stay open for the
+// whole run rather than being retired. An unbound port refuses instantly, so the re-ACK is paced
+// rather than retried on every refusal — otherwise each unused port pins a core. This interval
+// also bounds how long a server that just came up waits before it hears from us.
+const ACK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+// How long an idle assembly thread blocks waiting on its listener before looping again. Long
+// enough that a silent stream costs nothing, short enough to add no real latency to a live one.
+const ASSEMBLY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static FILE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[repr(u16)]
@@ -167,6 +178,9 @@ pub fn connect_to_all_udp_sockets(file: String) -> Vec<Arc<UdpSocket>> {
     }).collect()
 }
 
+// Listeners run for the whole session and never retire their port, so a drone that comes online
+// late is still picked up. They only ever exit by panicking, which the main thread treats as a
+// genuine failure of that stream.
 pub fn create_listener_thread(tx: Sender<Vec<u8>>, socket: Arc<UdpSocket>) -> Result<thread::JoinHandle<()>, std::io::Error> {
     let handle = thread::Builder::new().name("listener thread".to_string()).spawn(move || {
         let mut buffer = vec![0u8; 65536];
@@ -188,7 +202,10 @@ pub fn create_listener_thread(tx: Sender<Vec<u8>>, socket: Arc<UdpSocket>) -> Re
                     continue;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    // ACK bounced — server not bound yet; retry
+                    // Nothing bound on the far end yet. The server may still come up later in the
+                    // session, so hold the port and keep announcing ourselves — but sleep first,
+                    // because a refusal returns instantly and re-ACKing on every one spins a core.
+                    thread::sleep(ACK_RETRY_INTERVAL);
                     let _ = socket.send(b"ACK");
                     continue;
                 }
@@ -202,7 +219,10 @@ pub fn create_listener_thread(tx: Sender<Vec<u8>>, socket: Arc<UdpSocket>) -> Re
 }
 
 pub enum AssemblyMessage {
-    TransmissionComplete,
+    // this stream finished its initial file transfer; its entities are ready to join the scene
+    StreamReady,
+    // a stream that had already joined has signalled the end of its data
+    StreamFinished,
     SceneFileAssembled(String),
 }
 
@@ -216,6 +236,8 @@ pub fn create_assembly_thread(
     let handle = thread::Builder::new().name("assembly thread".to_string()).spawn(move || {
         let mut active_files: HashMap<Uuid, FileInfo> = HashMap::new();
         let mut buf: Vec<u8> = Vec::new();
+        // the first completed transmission is this stream joining; any later one is it wrapping up
+        let mut has_joined = false;
         loop {
             let (transmission_complete, scene_file_opt) =
                 receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry);
@@ -230,7 +252,12 @@ pub fn create_assembly_thread(
             }
 
             if transmission_complete {
-                let _ = tx_main.send(AssemblyMessage::TransmissionComplete);
+                let _ = tx_main.send(if has_joined {
+                    AssemblyMessage::StreamFinished
+                } else {
+                    has_joined = true;
+                    AssemblyMessage::StreamReady
+                });
             }
         }
     })
@@ -242,11 +269,8 @@ pub fn create_sender_thread(rx: Receiver<Vec<u8>>, socket: Arc<UdpSocket>) -> Re
     let handle = thread::Builder::new().name("sender thread".to_string()).spawn(move || {
         socket.send(b"ACK").unwrap();
 
-        loop {
-            let Ok(msg) = rx.try_recv() else {
-                continue
-            };
-
+        // block rather than poll — an idle stream should cost nothing while it waits for its drone
+        while let Ok(msg) = rx.recv() {
             socket.send(&msg).unwrap();
         }
     })
@@ -292,7 +316,7 @@ pub fn get_ports(file: &str) -> Result<Vec<SocketAddr>, Box<dyn std::error::Erro
 
 fn receive_file_metadata(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant) -> Option<FileInfo> {
     while buf.len() < FILE_START_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
-        let Ok(msg) = rx.try_recv() else {
+        let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
             return None
         };
 
@@ -322,7 +346,7 @@ fn receive_file_chunk(
     registry: &ring_buffer::BufferRegistry,
 ) -> Option<Vec<u8>> {
     while buf.len() < CHUNK_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
-        let Ok(msg) = rx.try_recv() else {
+        let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
             return None
         };
 
@@ -353,7 +377,7 @@ fn receive_file_chunk(
     let file_data = active_files.get_mut(&file_id).expect("invalid file");
     
     while buf.len() < CHUNK_METADATA_BYTE_WIDTH+(chunk_length as usize)+CHECKSUM_WIDTH && !has_timed_out(start_time){
-        let Ok(msg) = rx.try_recv() else {
+        let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
             return None
         };
 
@@ -412,7 +436,7 @@ fn receive_file_chunk(
 
 fn finish_receiving_file(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant, active_files: &mut HashMap<Uuid, FileInfo>) -> Option<(String, Vec<u8>)> {
     while buf.len() < FILE_END_METADATA_BYTE_WIDTH && !has_timed_out(start_time){
-        let Ok(msg) = rx.try_recv() else {
+        let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
             return None
         };
 
@@ -522,7 +546,7 @@ pub fn receive_file(
         }
     }
     while bytes_read < MESSAGE_TYPE_BYTE_WIDTH && !has_timed_out(start_time) {
-        let Ok(msg) = rx_main.try_recv() else {
+        let Ok(msg) = rx_main.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
             return (false, None)
         };
 

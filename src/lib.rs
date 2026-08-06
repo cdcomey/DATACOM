@@ -225,7 +225,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     // bind UDP sockets for all configured addresses
     let (tx_assembly, rx_assembly) = mpsc::channel::<com::AssemblyMessage>();
     let sockets = com::connect_to_all_udp_sockets(port_string);
-    let num_streams = sockets.len();
+    let configured_streams = sockets.len();
     let mut listeners = Vec::new();
 
     // for every successful connection, spawn a listener, sender, and assembler thread for that connection
@@ -241,29 +241,38 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     }
 
     // initial file transfer
-    // wait until all initial transmissions are complete before proceeding
-    debug!("assembling initial files...");
-    let mut completed = 0;
+    // A drone may connect at any point in the session, so we cannot know up front how many of the
+    // configured ports will ever be used. Block here until the first one has delivered its scene;
+    // every later arrival joins through the event loop instead.
+    info!("waiting for the first of {} configured stream(s) to connect...", configured_streams);
+    let mut ready_streams = 0usize;
     let mut extra_scene_jsons: Vec<String> = Vec::new();
     loop {
-        if listeners.iter().any(|l| l.is_finished()) { break; }
-        match rx_assembly.try_recv() {
-            Ok(com::AssemblyMessage::TransmissionComplete) => {
-                completed += 1;
-                if completed == num_streams { break; }
-            }
-            Ok(com::AssemblyMessage::SceneFileAssembled(json)) => {
-                extra_scene_jsons.push(json);
-            }
-            _ => {}
+        // listeners now only ever exit by panicking, so losing all of them means nothing can
+        // arrive on any port and waiting longer is pointless
+        if listeners.iter().all(|l| l.is_finished()) {
+            remove_file("data/scene_loading/main_scene.json").unwrap();
+            panic!("every listener thread terminated before any stream connected");
         }
+
+        // drain everything already queued before deciding, so drones that came up together are
+        // counted as one batch instead of the first one racing ahead of its peers
+        while let Ok(msg) = rx_assembly.try_recv() {
+            match msg {
+                com::AssemblyMessage::StreamReady => ready_streams += 1,
+                com::AssemblyMessage::SceneFileAssembled(json) => extra_scene_jsons.push(json),
+                com::AssemblyMessage::StreamFinished => {}
+            }
+        }
+
+        if ready_streams > 0 { break; }
+
+        // startup is not latency-sensitive, and this keeps the wait from pinning a core while
+        // we sit here for however long it takes the first drone to come online
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     debug!("finished assembling files!");
-
-    if listeners.iter().any(|l| l.is_finished()) {
-        remove_file("data/scene_loading/main_scene.json").unwrap();
-        panic!("listener thread terminated before event loop could start");
-    }
+    info!("{} stream(s) connected; starting renderer", ready_streams);
 
     // create window and event loop
     let event_loop = EventLoop::new().unwrap();
@@ -288,7 +297,9 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
 
     let mut last_render_time = std::time::Instant::now();
     let mut transmission_ended = false;
-    let mut transmissions_remaining = num_streams;
+    // streams that have joined and not yet signalled the end of their data; late joiners push this
+    // back up, so "everything has finished" only holds once it drops to zero again
+    let mut active_streams = ready_streams;
     let mut force_exit = false;
     let mut capture_saved = false;
 
@@ -358,10 +369,27 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
             }
             
             debug!("M: reading streamed files...");
-            if matches!(rx_assembly.try_recv(), Ok(com::AssemblyMessage::TransmissionComplete)) {
-                transmissions_remaining -= 1;
-                if transmissions_remaining == 0 {
-                    transmission_ended = true;
+            // drain everything queued rather than one message per frame — a message we drop here
+            // is a drone that silently never appears
+            while let Ok(msg) = rx_assembly.try_recv() {
+                match msg {
+                    com::AssemblyMessage::StreamReady => {
+                        active_streams += 1;
+                        transmission_ended = false;
+                        info!("stream connected mid-session ({} active)", active_streams);
+                    }
+                    com::AssemblyMessage::StreamFinished => {
+                        active_streams = active_streams.saturating_sub(1);
+                        if active_streams == 0 {
+                            transmission_ended = true;
+                        }
+                    }
+                    com::AssemblyMessage::SceneFileAssembled(json) => {
+                        // a drone that connected after the window opened; merge its entities into
+                        // the scene that is already being rendered
+                        let added = state.scene.append_entities_from_json_str(&json, &registry);
+                        info!("merged {} entities from a mid-session stream", added);
+                    }
                 }
             }
             if !capture_saved && (force_exit || (transmission_ended && state.scene.all_streams_exhausted())) {
