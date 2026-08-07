@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use winit::{
     event::*,
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::PhysicalKey,
     window::Window,
 };
 use wgpu::TextureUsages;
@@ -519,29 +519,38 @@ impl<'a> State<'a> {
     
     pub fn window_input(&mut self, event: &WindowEvent) -> bool {
         match event {
-            // Must precede the general keyboard arm below, which forwards everything to the camera.
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyT),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => {
-                self.scene.show_toast(format!("{:.1} FPS", self.framerate));
-                true
-            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         physical_key: PhysicalKey::Code(key),
                         state,
+                        repeat,
                         ..
                     },
                 ..
-            } => self.scene.viewports[0].camera_controller.process_keyboard(*key, *state, &self.scene.entities),
+            } => {
+                // Drop OS auto-repeat. `process_keyboard` treats every Pressed event as a
+                // fresh press, so a held Enter would toggle the camera mode dozens of times
+                // a second. Movement is unaffected: it reads the pressed-keys set, which a
+                // repeat would only redundantly re-insert.
+                if *repeat {
+                    return true;
+                }
+
+                // Watch the mode across the keypress rather than keying off Enter, so the
+                // message stays correct wherever the switch is triggered from, and never
+                // fires when `switch_mode` declines to switch.
+                let mode_before = self.scene.viewports[0].camera_controller.mode();
+                let handled = self.scene.viewports[0].camera_controller
+                    .process_keyboard(*key, *state, &self.scene.entities);
+                let mode_after = self.scene.viewports[0].camera_controller.mode();
+
+                if mode_after != mode_before {
+                    self.scene.show_toast(format!("Switched camera to {}", mode_after.display_name()));
+                }
+
+                handled
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.scene.viewports[0].camera_controller.process_scroll(delta);
                 true

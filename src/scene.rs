@@ -364,8 +364,12 @@ impl Scene {
     /// Shows a message that holds at full opacity for a second, then fades out quickly.
     ///
     /// Toasts are positioned in viewport-local coordinates, so one call draws the same
-    /// message in every viewport.
+    /// message in every viewport. Only one is shown at a time — every toast occupies the
+    /// same slot, so a new message replaces any still-fading predecessor rather than
+    /// overlapping it into unreadable text.
     pub fn show_toast(&mut self, content: String) {
+        self.toasts.clear();
+
         let display = self.text_resources.make_display(
             &self.device,
             content,

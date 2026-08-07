@@ -21,10 +21,20 @@ pub const OPENGL_TO_WGPU_MATRIX: Matrix4<f32> = Matrix4::new(
 
 const APPROX_ZERO: f32 = 1e-8;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CameraMode {
     FreeRoam,
     OrbitPoint,
+}
+
+impl CameraMode {
+    /// Human-readable name, for on-screen messages.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            CameraMode::FreeRoam => "Free Roam",
+            CameraMode::OrbitPoint => "Orbit Point",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -136,6 +146,8 @@ impl CameraController {
 
     pub fn camera(&self) -> &Camera { &self.camera }
 
+    pub fn mode(&self) -> CameraMode { self.mode }
+
     fn process_opposite_keys(pressed_keys: &HashSet<KeyCode>, key1: &KeyCode, key2: &KeyCode, key3: &KeyCode, key4: &KeyCode) -> f32 {
         (
             ((pressed_keys.contains(key1) || pressed_keys.contains(key2)) as i32) - 
@@ -225,6 +237,12 @@ impl CameraController {
     }
 
     pub fn switch_mode(&mut self, scene: &Vec<Entity>){
+        // OrbitPoint needs something to orbit, and the search below indexes scene[0].
+        // With no entities there is nothing to focus on, so stay in the current mode.
+        if scene.is_empty() {
+            return;
+        }
+
         match self.mode {
             CameraMode::FreeRoam => {
                 self.mode = CameraMode::OrbitPoint;
@@ -386,5 +404,35 @@ impl CameraUniform {
     pub fn update_view_proj(&mut self, camera: &Camera, projection: &Projection) {
         self.view_position = camera.position.to_homogeneous().into();
         self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into();
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_controller() -> CameraController {
+        let camera = Camera::new((0.0, 0.0, 0.0), Quaternion::new(1.0, 0.0, 0.0, 0.0));
+        CameraController::new(8.0, 1.0, camera)
+    }
+
+    #[test]
+    fn switch_mode_ignores_empty_scene() {
+        let mut controller = test_controller();
+        assert_eq!(controller.mode(), CameraMode::FreeRoam);
+
+        // Must not panic: the OrbitPoint branch indexes scene[0] to pick a focus target.
+        controller.switch_mode(&vec![]);
+
+        assert_eq!(
+            controller.mode(),
+            CameraMode::FreeRoam,
+            "a scene with no entities has nothing to orbit, so the mode must not change",
+        );
+    }
+
+    #[test]
+    fn camera_mode_display_names() {
+        assert_eq!(CameraMode::FreeRoam.display_name(), "Free Roam");
+        assert_eq!(CameraMode::OrbitPoint.display_name(), "Orbit Point");
     }
 }
