@@ -36,6 +36,7 @@ const CHUNK_OFFSET_BYTE_WIDTH: usize = 8;
 const CHUNK_LENGTH_BYTE_WIDTH: usize = 4;
 const CHUNK_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH + CHUNK_OFFSET_BYTE_WIDTH + CHUNK_LENGTH_BYTE_WIDTH;
 const FILE_END_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH;
+const RETRANSMIT_REQUEST_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH + CHUNK_OFFSET_BYTE_WIDTH;
 const CHECKSUM_WIDTH: usize = 4;
 
 const SECONDS_UNTIL_TIMEOUT: u64 = 30;
@@ -54,9 +55,10 @@ const ACK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const ASSEMBLY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static FILE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+// TODO: only public for test file; change later
 #[repr(u16)]
-#[derive(Debug)]
-enum MessageType {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageType {
     FILE_START,
     FILE_CHUNK,
     FILE_END,
@@ -77,6 +79,12 @@ impl MessageType {
             5 => MessageType::TRANSMISSION_ACK,
             _ => MessageType::ERROR,
         }
+    }
+
+    // the sole encoder for the message type field — every frame we build goes through here so the
+    // discriminants in this enum stay the single source of truth for the wire codes
+    pub fn to_be_bytes(self) -> [u8; MESSAGE_TYPE_BYTE_WIDTH] {
+        (self as u16).to_be_bytes()
     }
 }
 
@@ -226,6 +234,20 @@ pub enum AssemblyMessage {
     SceneFileAssembled(String),
 }
 
+// What a single `receive_file` dispatch produced for the assembly thread to act on. One datagram
+// carries one message, so these are mutually exclusive — which is why this is an enum rather than
+// the tuple of independent outputs the function used to return. New message types that the main
+// thread has to hear about get a variant here instead of another slot in that tuple.
+pub enum ReceiveOutcome {
+    // nothing for the caller to do: a partial frame, an idle poll, or a message whose whole effect
+    // landed in `active_files` or the ring-buffer registry
+    Nothing,
+    // a file finished assembling and turned out to be a scene JSON
+    SceneFile { name: String, data: Vec<u8> },
+    // the server signalled TRANSMISSION_END and has been ACKed
+    TransmissionComplete,
+}
+
 pub fn create_assembly_thread(
     rx: Receiver<Vec<u8>>,
     tx_sender: Sender<Vec<u8>>,
@@ -239,25 +261,27 @@ pub fn create_assembly_thread(
         // the first completed transmission is this stream joining; any later one is it wrapping up
         let mut has_joined = false;
         loop {
-            let (transmission_complete, scene_file_opt) =
-                receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry);
+            match receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry) {
+                ReceiveOutcome::Nothing => {}
 
-            if let Some((name, data)) = scene_file_opt {
-                if base_scene_written.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    append_to_file("main_scene.json".to_string(), data);
-                } else {
-                    let json_str = String::from_utf8(data).unwrap_or_default();
-                    let _ = tx_main.send(AssemblyMessage::SceneFileAssembled(json_str));
+                ReceiveOutcome::SceneFile { name, data } => {
+                    debug!("A: assembled scene file {}", name);
+                    if base_scene_written.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        append_to_file("main_scene.json".to_string(), data);
+                    } else {
+                        let json_str = String::from_utf8(data).unwrap_or_default();
+                        let _ = tx_main.send(AssemblyMessage::SceneFileAssembled(json_str));
+                    }
                 }
-            }
 
-            if transmission_complete {
-                let _ = tx_main.send(if has_joined {
-                    AssemblyMessage::StreamFinished
-                } else {
-                    has_joined = true;
-                    AssemblyMessage::StreamReady
-                });
+                ReceiveOutcome::TransmissionComplete => {
+                    let _ = tx_main.send(if has_joined {
+                        AssemblyMessage::StreamFinished
+                    } else {
+                        has_joined = true;
+                        AssemblyMessage::StreamReady
+                    });
+                }
             }
         }
     })
@@ -395,9 +419,8 @@ fn receive_file_chunk(
     if checksum_expected != checksum_actual {
         debug!("checksum failed");
         buf.drain(0..CHUNK_METADATA_BYTE_WIDTH + chunk_length + CHECKSUM_WIDTH);
-        let msg_type = MessageType::REQUEST_RETRANSMIT_CHUNK;
         let mut request_buf = Vec::<u8>::new();
-        request_buf.extend_from_slice(&(msg_type as u16).to_be_bytes());
+        request_buf.extend_from_slice(&MessageType::REQUEST_RETRANSMIT_CHUNK.to_be_bytes());
         request_buf.extend_from_slice(&file_id_bytes);
         request_buf.extend_from_slice(&chunk_offset_bytes);
         return Some(request_buf)
@@ -528,13 +551,22 @@ fn append_to_file(file_name: String, data: Vec<u8>){
     // let _ = writeln!(&mut file, "{}", file_contents.as_str());
 }
 
+// `buf` persists across receive_file() calls, so every dispatch arm has to consume its own frame
+// out of the front of it. An arm that returns without draining leaves the same message type sitting
+// at offset 0, the next call re-dispatches it, and the assembly thread spins on it forever.
+// Clamped to the buffer length because the arms that use this handle frames that should never
+// reach the client at all — dropping a partial one beats pinning a core on it.
+fn drain_frame(buf: &mut Vec<u8>, width: usize) {
+    buf.drain(0..width.min(buf.len()));
+}
+
 pub fn receive_file(
     rx_main: &Receiver<Vec<u8>>,
     tx_sender: &Sender<Vec<u8>>,
     active_files: &mut HashMap<Uuid, FileInfo>,
     buf: &mut Vec<u8>,
     registry: &ring_buffer::BufferRegistry,
-) -> (bool, Option<(String, Vec<u8>)>) {
+) -> ReceiveOutcome {
     // debug!("Preparing to receive file");
     let start_time = std::time::Instant::now();
 
@@ -547,7 +579,7 @@ pub fn receive_file(
     }
     while bytes_read < MESSAGE_TYPE_BYTE_WIDTH && !has_timed_out(start_time) {
         let Ok(msg) = rx_main.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
-            return (false, None)
+            return ReceiveOutcome::Nothing
         };
 
         let msg_len = msg.len();
@@ -579,7 +611,7 @@ pub fn receive_file(
                 debug!("L: adding {} to active files", file.id);
                 active_files.insert(file.id, file);
             }
-            (false, None)
+            ReceiveOutcome::Nothing
         },
         MessageType::FILE_CHUNK => {
             debug!("L: received FILE_CHUNK");
@@ -591,33 +623,43 @@ pub fn receive_file(
                     debug!("Error attempting to send packet from listener to main thread: {}", e);
                 }
             }
-            (false, None)
+            ReceiveOutcome::Nothing
         },
         MessageType::FILE_END => {
             debug!("L: received FILE_END");
-            let scene_opt = finish_receiving_file(&rx_main, buf, start_time, active_files);
-            (false, scene_opt)
+            match finish_receiving_file(&rx_main, buf, start_time, active_files) {
+                Some((name, data)) => ReceiveOutcome::SceneFile { name, data },
+                None => ReceiveOutcome::Nothing,
+            }
         },
         MessageType::REQUEST_RETRANSMIT_CHUNK => {
-            debug!("L: received REQUEST_RETRANSMIT_CHUNK");
-            (false, None)
+            // the client is the one that sends these; a server echoing one back has nothing for us
+            // to do, but the frame still has to come off the buffer
+            debug!("L: received REQUEST_RETRANSMIT_CHUNK (unexpected on client)");
+            drain_frame(buf, RETRANSMIT_REQUEST_BYTE_WIDTH);
+            ReceiveOutcome::Nothing
         },
         MessageType::TRANSMISSION_END => {
             debug!("L: received TRANSMISSION_END");
             finish_receiving_transmission(buf);
             let mut ack = Vec::new();
-            ack.extend_from_slice(&5u16.to_be_bytes());
+            ack.extend_from_slice(&MessageType::TRANSMISSION_ACK.to_be_bytes());
             let _ = tx_sender.send(ack);
-            (true, None)
+            ReceiveOutcome::TransmissionComplete
         }
         MessageType::TRANSMISSION_ACK => {
             debug!("L: received TRANSMISSION_ACK (unexpected on client)");
-            buf.drain(0..MESSAGE_TYPE_BYTE_WIDTH);
-            (false, None)
+            drain_frame(buf, MESSAGE_TYPE_BYTE_WIDTH);
+            ReceiveOutcome::Nothing
         }
         MessageType::ERROR => {
-            debug!("L: received ERROR");
-            (false, None)
+            // any code we don't recognise lands here, which is where a newer server talking to an
+            // older client shows up. We can't know the frame's real length, so drop just the type
+            // field and resynchronise on whatever follows rather than re-dispatching these two
+            // bytes on every iteration.
+            debug!("L: received ERROR (unrecognised message type)");
+            drain_frame(buf, MESSAGE_TYPE_BYTE_WIDTH);
+            ReceiveOutcome::Nothing
         },
     }
 }
@@ -698,6 +740,78 @@ mod tests {
 //     fn load_font() {
         
 //     }
+
+    // Feeds one already-buffered frame through receive_file and returns what is left in `buf`.
+    // The channel is never read: with the frame already in `buf`, receive_file dispatches on it
+    // without touching the listener.
+    fn dispatch_buffered_frame(frame: Vec<u8>) -> (ReceiveOutcome, Vec<u8>) {
+        let (_tx_listener, rx_listener) = mpsc::channel::<Vec<u8>>();
+        let (tx_sender, _rx_sender) = mpsc::channel::<Vec<u8>>();
+        let mut active_files: HashMap<Uuid, FileInfo> = HashMap::new();
+        let mut buf = frame;
+        let registry = ring_buffer::new_registry();
+
+        let outcome = receive_file(&rx_listener, &tx_sender, &mut active_files, &mut buf, &registry);
+        (outcome, buf)
+    }
+
+    // An arm that returns without draining leaves its message type at offset 0, so the assembly
+    // thread's loop re-dispatches the same bytes forever and pins a core. Unrecognised codes are
+    // the likeliest way to hit this — that is what a newer server's message looks like here.
+    #[test]
+    fn unknown_message_type_is_drained() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&999u16.to_be_bytes());
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Nothing));
+        assert!(buf.is_empty(), "ERROR arm left {} byte(s) in buf to be re-dispatched", buf.len());
+    }
+
+    // The client is the sender of these, but a server echoing one back must not wedge it either.
+    #[test]
+    fn retransmit_request_is_drained() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MessageType::REQUEST_RETRANSMIT_CHUNK.to_be_bytes());
+        frame.extend_from_slice(&[0u8; FILE_ID_BYTE_WIDTH]);
+        frame.extend_from_slice(&0u64.to_be_bytes());
+        assert_eq!(frame.len(), RETRANSMIT_REQUEST_BYTE_WIDTH);
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Nothing));
+        assert!(buf.is_empty(), "REQUEST_RETRANSMIT_CHUNK arm left {} byte(s) in buf", buf.len());
+    }
+
+    // A short frame must not panic the drain, and must still leave nothing to re-dispatch.
+    #[test]
+    fn partial_frame_drain_does_not_panic() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MessageType::REQUEST_RETRANSMIT_CHUNK.to_be_bytes());
+        frame.extend_from_slice(&[0u8; 4]);
+
+        let (_outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(buf.is_empty());
+    }
+
+    // The wire codes are the protocol contract in README.md; the enum discriminants now encode
+    // them, so a variant inserted in the middle would silently renumber every later message.
+    #[test]
+    fn message_type_codes_match_the_wire_protocol() {
+        for (msg_type, code) in [
+            (MessageType::FILE_START, 0u16),
+            (MessageType::FILE_CHUNK, 1),
+            (MessageType::FILE_END, 2),
+            (MessageType::REQUEST_RETRANSMIT_CHUNK, 3),
+            (MessageType::TRANSMISSION_END, 4),
+            (MessageType::TRANSMISSION_ACK, 5),
+        ] {
+            assert_eq!(msg_type.to_be_bytes(), code.to_be_bytes(), "{:?} encodes to the wrong code", msg_type);
+            assert_eq!(MessageType::get_from_bytes(code), msg_type, "code {} decodes to the wrong variant", code);
+        }
+    }
 
     fn vectors_match(v1: Result<Vec<SocketAddr>, Box<dyn std::error::Error>>, v2: Result<Vec<SocketAddr>, Box<dyn std::error::Error>>) -> bool{
         match v1{

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::com::{MAX_FILE_NAME_BYTE_WIDTH, get_ports, has_timed_out};
+use crate::com::{MAX_FILE_NAME_BYTE_WIDTH, MessageType, get_ports, has_timed_out};
 
 #[derive(Clone)]
 pub enum StreamMode {
@@ -23,7 +23,6 @@ fn send_finite_test_data(socket: &UdpSocket, path_str: &str, addr: SocketAddr) {
     let test_command_data_main = fs::read_to_string(path).unwrap();
     let data_len = test_command_data_main.len();
 
-    let message_type = 0u16;
     let file_id = *Uuid::new_v4().as_bytes();
     let file_name_string = format!("{}_main_scene.json", addr.port());
     let file_name_base = file_name_string.as_str();
@@ -33,7 +32,7 @@ fn send_finite_test_data(socket: &UdpSocket, path_str: &str, addr: SocketAddr) {
     let file_len = test_command_data_main.len() as u32;
 
     let mut test_command_data: Vec<u8> = Vec::new();
-    test_command_data.extend_from_slice(&message_type.to_be_bytes());
+    test_command_data.extend_from_slice(&MessageType::FILE_START.to_be_bytes());
     test_command_data.extend_from_slice(&file_id);
     test_command_data.extend_from_slice(&[file_name_length]);
     test_command_data.extend_from_slice(&file_name);
@@ -46,12 +45,11 @@ fn send_finite_test_data(socket: &UdpSocket, path_str: &str, addr: SocketAddr) {
     thread::sleep(Duration::from_millis(10));
     socket.send(&test_command_data).unwrap();
 
-    let message_type = 1u16;
     let mut chunk_offset = 0u64;
     let chunk_length_default = 1024u32;
     while (chunk_offset as usize) < data_len {
         test_command_data.clear();
-        test_command_data.extend_from_slice(&message_type.to_be_bytes());
+        test_command_data.extend_from_slice(&MessageType::FILE_CHUNK.to_be_bytes());
         test_command_data.extend_from_slice(&file_id);
         test_command_data.extend_from_slice(&chunk_offset.to_be_bytes());
 
@@ -78,9 +76,8 @@ fn send_finite_test_data(socket: &UdpSocket, path_str: &str, addr: SocketAddr) {
         socket.send(&test_command_data).unwrap();
     }
 
-    let message_type = 2u16;
     test_command_data.clear();
-    test_command_data.extend_from_slice(&message_type.to_be_bytes());
+    test_command_data.extend_from_slice(&MessageType::FILE_END.to_be_bytes());
     test_command_data.extend_from_slice(&file_id);
 
     info!("{:?}: Sending file end to stream", file_id);
@@ -88,9 +85,8 @@ fn send_finite_test_data(socket: &UdpSocket, path_str: &str, addr: SocketAddr) {
     thread::sleep(Duration::from_millis(10));
     socket.send(&test_command_data).unwrap();
 
-    let message_type = 4u16;
     test_command_data.clear();
-    test_command_data.extend_from_slice(&message_type.to_be_bytes());
+    test_command_data.extend_from_slice(&MessageType::TRANSMISSION_END.to_be_bytes());
 
     info!("{:?}: Sending transmission end to stream", file_id);
     debug!("{:?}", test_command_data);
@@ -114,7 +110,7 @@ fn send_streaming_data(
     file_name[0..file_name_length as usize].copy_from_slice(file_name_base.as_bytes());
 
     let mut buf: Vec<u8> = Vec::new();
-    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&MessageType::FILE_START.to_be_bytes());
     buf.extend_from_slice(&file_id);
     buf.extend_from_slice(&[file_name_length]);
     buf.extend_from_slice(&file_name);
@@ -135,7 +131,7 @@ fn send_streaming_data(
 
         let checksum = crc32fast::hash(&payload);
         buf.clear();
-        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(&MessageType::FILE_CHUNK.to_be_bytes());
         buf.extend_from_slice(&file_id);
         buf.extend_from_slice(&chunk_offset.to_be_bytes());
         buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -150,7 +146,7 @@ fn send_streaming_data(
     }
 
     buf.clear();
-    buf.extend_from_slice(&2u16.to_be_bytes());
+    buf.extend_from_slice(&MessageType::FILE_END.to_be_bytes());
     buf.extend_from_slice(&file_id);
 
     info!("S: Sending file end to stream");
@@ -158,7 +154,7 @@ fn send_streaming_data(
     socket.send(&buf).unwrap();
 
     buf.clear();
-    buf.extend_from_slice(&4u16.to_be_bytes());
+    buf.extend_from_slice(&MessageType::TRANSMISSION_END.to_be_bytes());
 
     info!("S: Sending transmission end to stream");
     thread::sleep(Duration::from_millis(10));
