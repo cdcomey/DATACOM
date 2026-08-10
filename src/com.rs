@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use crate::ring_buffer;
 use std::path::Path;
 use toml::Value;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uuid::Uuid;
 
@@ -248,24 +248,57 @@ pub enum ReceiveOutcome {
     TransmissionComplete,
 }
 
+// A server declares itself the command authority with a top-level `"authority": true` in its scene
+// JSON. Only that one key is inspected here — the renderer parses the rest of the scene on the main
+// thread — so a scene that omits it, sets it to anything other than a JSON bool, or fails to parse
+// at all simply yields false. Declaring is opt-in precisely so a peer fleet, where no stream is an
+// operator, ends up with no authority rather than an arbitrary one.
+fn scene_declares_authority(data: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|scene| scene["authority"].as_bool())
+        .unwrap_or(false)
+}
+
 pub fn create_assembly_thread(
     rx: Receiver<Vec<u8>>,
     tx_sender: Sender<Vec<u8>>,
     tx_main: Sender<AssemblyMessage>,
     registry: ring_buffer::BufferRegistry,
     base_scene_written: Arc<AtomicBool>,
+    authority_claimed: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, std::io::Error> {
     let handle = thread::Builder::new().name("assembly thread".to_string()).spawn(move || {
         let mut active_files: HashMap<Uuid, FileInfo> = HashMap::new();
         let mut buf: Vec<u8> = Vec::new();
         // the first completed transmission is this stream joining; any later one is it wrapping up
         let mut has_joined = false;
+        // Whether *this* stream holds command authority. Kept per-thread rather than shared so the
+        // gate on an incoming global command is a local read: the stream that received the command
+        // is the one that knows whether it may act on it.
+        let mut has_authority = false;
         loop {
             match receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry) {
                 ReceiveOutcome::Nothing => {}
 
                 ReceiveOutcome::SceneFile { name, data } => {
                     debug!("A: assembled scene file {}", name);
+
+                    // Checked on every scene rather than only the base one: an operator console is
+                    // as likely to connect after the drones are already streaming as before them,
+                    // and it still gets authority when it does.
+                    if scene_declares_authority(&data) {
+                        if authority_claimed.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            has_authority = true;
+                            info!("stream claimed command authority via scene {}", name);
+                        } else if !has_authority {
+                            // Re-declaring from the stream that already holds it is fine; a second
+                            // stream declaring is a misconfiguration worth surfacing, since its
+                            // global commands will be silently ignored from here on.
+                            warn!("scene {} claims command authority, but another stream already holds it", name);
+                        }
+                    }
+
                     if base_scene_written.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                         append_to_file("main_scene.json".to_string(), data);
                     } else {
@@ -794,6 +827,50 @@ mod tests {
         let (_outcome, buf) = dispatch_buffered_frame(frame);
 
         assert!(buf.is_empty());
+    }
+
+    // Authority is opt-in: anything that is not an explicit JSON `true` leaves the stream without
+    // it. A peer fleet's scenes omit the key entirely, which is the case that has to stay false.
+    #[test]
+    fn authority_is_declared_only_by_an_explicit_true() {
+        let cases = [
+            (r#"{"authority": true, "entities": []}"#, true),
+            (r#"{"authority": false, "entities": []}"#, false),
+            // the ordinary peer-fleet scene: no key at all
+            (r#"{"viewports": [], "entities": []}"#, false),
+            // a truthy-looking value in another type must not count
+            (r#"{"authority": "true"}"#, false),
+            (r#"{"authority": 1}"#, false),
+            (r#"{"authority": null}"#, false),
+            // malformed or non-object JSON must not panic or claim
+            ("not json at all", false),
+            ("[1, 2, 3]", false),
+            ("", false),
+        ];
+
+        for (scene, expected) in cases {
+            assert_eq!(
+                scene_declares_authority(scene.as_bytes()),
+                expected,
+                "scene {:?} should{} declare authority",
+                scene,
+                if expected { "" } else { " not" },
+            );
+        }
+    }
+
+    // The declaration is read straight off the assembled bytes, so it has to survive a scene large
+    // enough to be chunked, with the key nowhere near the front.
+    #[test]
+    fn authority_is_found_late_in_a_large_scene() {
+        let filler: String = (0..2000)
+            .map(|i| format!(r#"{{"Name": "Drone_{}"}}"#, i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let scene = format!(r#"{{"entities": [{}], "authority": true}}"#, filler);
+        assert!(scene.len() > 1024, "scene should span multiple chunks");
+
+        assert!(scene_declares_authority(scene.as_bytes()));
     }
 
     // The wire codes are the protocol contract in README.md; the enum discriminants now encode

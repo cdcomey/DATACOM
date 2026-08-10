@@ -220,6 +220,10 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
 
     let registry = ring_buffer::new_registry();
     let base_scene_written = Arc::new(AtomicBool::new(false));
+    // Command authority is declared by a server rather than raced for, so it is claimed at most
+    // once per run by whichever stream declares it first. A peer fleet has no operator, declares
+    // nothing, and leaves this false — which is what makes global commands inert there.
+    let authority_claimed = Arc::new(AtomicBool::new(false));
 
     // the assembly-main communication is high-level, and only needs to send an enum
     // bind UDP sockets for all configured addresses
@@ -237,7 +241,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
         let listener = com::create_listener_thread(tx_listener, Arc::clone(&socket)).unwrap();
         listeners.push(listener);
         com::create_sender_thread(rx_sender, Arc::clone(&socket)).unwrap();
-        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone(), Arc::clone(&registry), Arc::clone(&base_scene_written)).unwrap();
+        com::create_assembly_thread(rx_listener, tx_sender, tx_assembly.clone(), Arc::clone(&registry), Arc::clone(&base_scene_written), Arc::clone(&authority_claimed)).unwrap();
     }
 
     // initial file transfer
@@ -296,10 +300,13 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
     }
 
     let mut last_render_time = std::time::Instant::now();
-    let mut transmission_ended = false;
     // streams that have joined and not yet signalled the end of their data; late joiners push this
     // back up, so "everything has finished" only holds once it drops to zero again
     let mut active_streams = ready_streams;
+    // Running out of data is not a reason to quit — a drone can connect at any point in a session,
+    // so the client idles and keeps rendering instead. This only tracks whether we have already
+    // said so, to keep it to one line per idle period rather than one per frame.
+    let mut idle_reported = false;
     let mut force_exit = false;
     let mut capture_saved = false;
 
@@ -375,14 +382,11 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                 match msg {
                     com::AssemblyMessage::StreamReady => {
                         active_streams += 1;
-                        transmission_ended = false;
+                        idle_reported = false;
                         info!("stream connected mid-session ({} active)", active_streams);
                     }
                     com::AssemblyMessage::StreamFinished => {
                         active_streams = active_streams.saturating_sub(1);
-                        if active_streams == 0 {
-                            transmission_ended = true;
-                        }
                     }
                     com::AssemblyMessage::SceneFileAssembled(json) => {
                         // a drone that connected after the window opened; merge its entities into
@@ -392,7 +396,18 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                     }
                 }
             }
-            if !capture_saved && (force_exit || (transmission_ended && state.scene.all_streams_exhausted())) {
+            // A stream signalling the end of its data does not mean the scene has stopped moving:
+            // buffered frames keep draining for a while after the last chunk lands. Wait for both
+            // before calling it idle, and say so once so a quiet window reads as "waiting for a
+            // drone" rather than as a hang.
+            if !idle_reported && active_streams == 0 && state.scene.all_streams_exhausted() {
+                idle_reported = true;
+                info!("all streams finished and buffered data consumed; idling for new connections");
+            }
+
+            // Only the operator ends the session. Unanswered ports stay open for the whole run, so
+            // there is always the possibility of another drone connecting.
+            if !capture_saved && force_exit {
                 capture_saved = true;
                 if should_save_to_file {
                     state.scene.finish_capture(state.size.width, state.size.height);

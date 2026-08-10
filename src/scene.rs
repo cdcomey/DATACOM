@@ -825,6 +825,28 @@ impl Scene {
         self.entities.iter().all(|e| e.all_streams_exhausted())
     }
 
+    /// Resets the scene to a single camera and no entities.
+    ///
+    /// Takes the registry so the entity drop and the buffer purge happen together: they are one
+    /// operation, and splitting them lets a replacement scene bind a name whose buffer is about to
+    /// be dropped. See `ring_buffer::clear_registry` for why dropping entities alone is not enough.
+    ///
+    /// Deliberately left intact:
+    /// - `terrain` and any viewport beyond the first are environment the *first* scene defined.
+    ///   `base_scene_written` is one-way, so nothing can ever re-establish them — wiping terrain
+    ///   would be unrecoverable for the rest of the run.
+    /// - `text_boxes` is HUD chrome, not scene content; `state.rs` indexes `text_boxes[0]` for the
+    ///   framerate readout and would panic if it were emptied.
+    /// - the frame and timestep counters, so a clear does not look like a restart to anything
+    ///   reading data by index.
+    pub fn clear(&mut self, registry: &ring_buffer::BufferRegistry) {
+        self.entities.clear();
+        ring_buffer::clear_registry(registry);
+        // keep the first viewport rather than building a fresh one: it already owns a valid camera
+        // and bind groups, and index 0 is what the input handlers in state.rs address
+        self.viewports.truncate(1);
+    }
+
     // returns how many entities were merged in, so callers can report whether a stream that
     // connected actually contributed anything to the scene
     pub fn append_entities_from_json_str(&mut self, json_str: &str, registry: &ring_buffer::BufferRegistry) -> usize {

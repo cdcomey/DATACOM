@@ -147,6 +147,7 @@ Upon receiving `TRANSMISSION_END`, the client replies with a `TRANSMISSION_ACK` 
 The scene JSON file defines the initial 3D environment and entities. Entities form a **hierarchical scene graph**: each entity has a `Children` array whose members are themselves entities (with their own transforms, meshes, behaviors, and children). Rotations are quaternions in `[w, x, y, z]` order. Example structure:
 ```json
 {
+  "authority": true,         // Optional: claim command authority (see below); defaults to false
   "viewports": [
     {
       "x": 0.0,
@@ -258,6 +259,31 @@ The contents of the `data` field depend on `behaviorType`:
 ```
 
 For `ChangeTransform`, one set of 12 transform values is consumed every frame — from a streamed `.bin` file (via the ring buffer), an HDF5 `states` dataset, or inline values. This enables entities to follow streamed trajectory data. The three rotation components are interpreted as the vector part of a unit quaternion, with the scalar part derived so the quaternion is normalized.
+
+### Command Authority
+
+Scene content is decentralized — every stream contributes entities, and no stream is privileged. Some
+operations are inherently global, though: they affect entities that other streams contributed. A
+server opts into issuing those by setting a top-level `"authority": true` in its scene JSON.
+
+The rules are deliberately minimal:
+
+- **Declared, not elected.** Authority is never inferred from connection order, scene size, or any
+  other race. A stream has it only if it asked for it.
+- **Claimed once per run, first declarer wins.** A second stream that declares is logged as a
+  warning and does not receive authority; its global commands are ignored from that point on.
+- **Granted whenever the declaring stream arrives.** An operator console that connects after the
+  drones are already streaming still receives authority when its scene is assembled.
+- **Absent by default.** A peer-to-peer fleet declares nothing, so no stream holds authority and
+  global commands are inert. This is the intended behavior for that deployment, not a degraded mode
+  — there are no separate centralized and decentralized modes to configure.
+
+Authority and base-scene ownership are independent. The first scene to finish assembling still
+defines viewports and terrain regardless of who holds authority, so a late-arriving operator takes
+command authority without redefining the environment.
+
+Note that this is a coordination mechanism, not a security one: the wire protocol is unauthenticated,
+so authority prevents conflicting or accidental global commands, not hostile ones.
 
 ### Live Data Streaming
 
