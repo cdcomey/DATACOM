@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use winit::{
     event::*,
-    keyboard::PhysicalKey,
+    keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
 use wgpu::TextureUsages;
@@ -520,16 +520,18 @@ impl<'a> State<'a> {
         true
     }
     
-    /// Names a viewport for on-screen messages.
+    /// Tags an on-screen message with the viewport it refers to.
     ///
-    /// A single-viewport scene has no ambiguity to resolve, so it stays "the camera" and the
-    /// messages read as they did before viewports were addressable. Otherwise the index is
-    /// the one from the scene JSON's `viewports` array, so a message points at a line of JSON.
-    fn describe_viewport(&self, index: usize) -> String {
+    /// Toasts draw in every viewport at once, so in a multi-viewport scene an untagged message
+    /// about one camera reads as though it applied to all of them. A single-viewport scene has
+    /// no ambiguity to resolve and is left alone, so its messages read as they did before
+    /// viewports became addressable. The index is the one from the scene JSON's `viewports`
+    /// array, so a message points at a line of JSON.
+    fn viewport_toast(&self, index: usize, message: String) -> String {
         if self.scene.viewports.len() < 2 {
-            "camera".to_string()
+            message
         } else {
-            format!("viewport {}", index)
+            format!("[viewport {}] {}", index, message)
         }
     }
 
@@ -553,9 +555,9 @@ impl<'a> State<'a> {
                     return true;
                 }
 
-                // Watch the mode across the keypress rather than keying off Enter, so the
-                // message stays correct wherever the switch is triggered from, and never
-                // fires when `switch_mode` declines to switch.
+                // Watch the mode across the keypress rather than keying off Enter, so the message
+                // stays correct wherever the switch is triggered from and never fires when
+                // `switch_mode` declines to switch.
                 //
                 // Indexed rather than routed through `focused_camera`, so the borrow stays
                 // scoped to `viewports` and `process_keyboard` can still take `&entities`.
@@ -565,9 +567,30 @@ impl<'a> State<'a> {
                     .process_keyboard(*key, *state, &self.scene.entities);
                 let mode_after = self.scene.viewports[focused].camera_controller.mode();
 
+                let cycled = *key == KeyCode::KeyT
+                    && *state == ElementState::Pressed
+                    && mode_after == camera::CameraMode::OrbitPoint;
+
                 if mode_after != mode_before {
-                    let target = self.describe_viewport(focused);
-                    self.scene.show_toast(format!("Switched {} to {}", target, mode_after.display_name()));
+                    let msg = self.viewport_toast(
+                        focused,
+                        format!("Switched camera to {}", mode_after.display_name()),
+                    );
+                    self.scene.show_toast(msg);
+                } else if cycled {
+                    // Reported on every press rather than only when the target actually moved.
+                    // A scene whose entities are already exhausted by one cycle would otherwise
+                    // swallow the keypress with no feedback at all, which is indistinguishable
+                    // from the binding being broken. Re-showing the current target says "that
+                    // worked, there is just nowhere else to go".
+                    //
+                    // Skipped when the mode changed: entering OrbitPoint already implies a
+                    // target, and toasts share one slot, so this would erase that message.
+                    let entity = self.scene.viewports[focused].camera_controller.orbit_target()
+                        .and_then(|i| self.scene.entities.get(i))
+                        .map_or("?".to_string(), |e| e.name().to_string());
+                    let msg = self.viewport_toast(focused, format!("Orbiting {}", entity));
+                    self.scene.show_toast(msg);
                 }
 
                 handled
@@ -592,9 +615,12 @@ impl<'a> State<'a> {
                         self.cursor_position.y as f32,
                     ) {
                         if self.scene.focus_viewport(hit) {
-                            let target = self.describe_viewport(hit);
                             let mode = self.scene.viewports[hit].camera_controller.mode();
-                            self.scene.show_toast(format!("Controlling {} ({})", target, mode.display_name()));
+                            let msg = self.viewport_toast(
+                                hit,
+                                format!("Now controlling ({})", mode.display_name()),
+                            );
+                            self.scene.show_toast(msg);
                         }
                     }
                 }

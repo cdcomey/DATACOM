@@ -116,6 +116,10 @@ pub struct CameraController {
     camera: Camera,
     mode: CameraMode,
     point_of_focus: Option<Rc<RefCell<Point3<f32>>>>,
+    /// Index into the scene's entity list of what this viewport orbits, remembered across mode
+    /// switches so returning to `OrbitPoint` resumes the same entity rather than resetting to
+    /// the scene default. Per-controller, so two viewports can watch two different drones.
+    orbit_target: Option<usize>,
     radius: Option<f32>,
     h_angle: Option<Rad<f32>>,
     v_angle: Option<Rad<f32>>,
@@ -138,6 +142,7 @@ impl CameraController {
             camera,
             mode: CameraMode::FreeRoam,
             point_of_focus: None,
+            orbit_target: None,
             radius: None,
             h_angle: None,
             v_angle: None,
@@ -147,6 +152,8 @@ impl CameraController {
     pub fn camera(&self) -> &Camera { &self.camera }
 
     pub fn mode(&self) -> CameraMode { self.mode }
+
+    pub fn orbit_target(&self) -> Option<usize> { self.orbit_target }
 
     fn process_opposite_keys(pressed_keys: &HashSet<KeyCode>, key1: &KeyCode, key2: &KeyCode, key3: &KeyCode, key4: &KeyCode) -> f32 {
         (
@@ -164,6 +171,10 @@ impl CameraController {
 
                 if key == KeyCode::Enter {
                     self.switch_mode(scene);
+                }
+
+                if key == KeyCode::KeyT {
+                    self.cycle_orbit_target(scene);
                 }
 
                 if key == KeyCode::KeyC {
@@ -255,8 +266,17 @@ impl CameraController {
         };
     }
 
+    /// What a viewport orbits before the user has chosen anything.
+    ///
+    /// A moving entity is the better guess for what someone wants to watch on entering orbit
+    /// mode, so the first mover wins; a scene of nothing but static geometry falls back to the
+    /// first entity. This only picks the *default* — cycling reaches every entity.
+    fn default_orbit_target(scene: &Vec<Entity>) -> usize {
+        scene.iter().position(|e| e.has_movement_behavior()).unwrap_or(0)
+    }
+
     pub fn switch_mode(&mut self, scene: &Vec<Entity>){
-        // OrbitPoint needs something to orbit, and the search below indexes scene[0].
+        // OrbitPoint needs something to orbit, and the search below indexes into the scene.
         // With no entities there is nothing to focus on, so stay in the current mode.
         if scene.is_empty() {
             return;
@@ -264,13 +284,19 @@ impl CameraController {
 
         match self.mode {
             CameraMode::FreeRoam => {
+                // Resume this viewport's own target if it still exists — entities are only ever
+                // appended, so a live index stays valid, but a scene clear invalidates it.
+                let target = self.orbit_target
+                    .filter(|i| *i < scene.len())
+                    .unwrap_or_else(|| CameraController::default_orbit_target(scene));
+
                 self.mode = CameraMode::OrbitPoint;
-                let target = scene.iter().find(|e| e.has_movement_behavior()).unwrap_or(&scene[0]);
-                self.point_of_focus = Some(target.get_position());
+                self.orbit_target = Some(target);
+                self.point_of_focus = Some(scene[target].get_position());
                 self.radius = Some(5.0);
                 self.h_angle = Some(Rad(PI));
                 self.v_angle = Some(Rad(0.0));
-                
+
                 // self.v_angle = Some(Rad(1.5751947));
                 // let forward = (point - self.camera.position).normalize();
                 // self.camera.yaw = Rad(forward.z.atan2(forward.x));
@@ -281,8 +307,31 @@ impl CameraController {
                 self.radius = None;
                 self.h_angle = None;
                 self.v_angle = None;
+                // orbit_target is deliberately kept, so a round trip through free roam comes
+                // back to the same entity instead of snapping to the scene default.
             }
         }
+    }
+
+    /// Points this viewport at the next entity, wrapping at the end of the scene.
+    ///
+    /// Every entity is reachable, not just the ones that move. Static geometry is frequently the
+    /// thing worth inspecting — a scene's landmark is often the fixed object and the drone is what
+    /// flies past it — and skipping it strands scenes whose only mover is already the target.
+    ///
+    /// Only meaningful while orbiting, so it is a no-op in free roam rather than silently
+    /// changing state the user cannot see. The radius and angles carry over, so the camera keeps
+    /// its framing and the new entity simply slides into the position the old one occupied.
+    pub fn cycle_orbit_target(&mut self, scene: &Vec<Entity>) {
+        if self.mode != CameraMode::OrbitPoint || scene.is_empty() {
+            return;
+        }
+
+        // A stale index from a cleared scene still lands somewhere valid.
+        let next = self.orbit_target.map_or(0, |t| (t + 1) % scene.len());
+
+        self.orbit_target = Some(next);
+        self.point_of_focus = Some(scene[next].get_position());
     }
 
     pub fn update_camera(&mut self, dt: Duration){
@@ -429,9 +478,30 @@ impl CameraUniform {
 mod tests {
     use super::*;
 
+    use crate::behaviors_and_entities::{Behavior, BehaviorType};
+
     fn test_controller() -> CameraController {
         let camera = Camera::new((0.0, 0.0, 0.0), Quaternion::new(1.0, 0.0, 0.0, 0.0));
         CameraController::new(8.0, 1.0, camera)
+    }
+
+    /// Builds a scene from `(name, x, moves)` triples. Entities are spread along x so that a
+    /// camera's position identifies which one it settled on.
+    fn test_scene(spec: &[(&str, f32, bool)]) -> Vec<Entity> {
+        spec.iter()
+            .map(|(name, x, moves)| {
+                let behavior = moves.then(||
+                    Behavior::new(BehaviorType::Translate, vec![0.0, 0.0, 0.0], None)
+                );
+                Entity::for_test(name, Point3::new(*x, 0.0, 0.0), behavior)
+            })
+            .collect()
+    }
+
+    /// Where the camera ends up once an orbit frame has been applied.
+    fn orbit_position(controller: &mut CameraController) -> Point3<f32> {
+        controller.update_camera(Duration::from_millis(16));
+        controller.camera().position
     }
 
     #[test]
@@ -486,6 +556,113 @@ mod tests {
         assert_eq!(controller.rotate_horizontal, 0.0);
         assert_eq!(controller.rotate_vertical, 0.0);
         assert_eq!(controller.scroll, 0.0);
+    }
+
+    // The point of a per-controller orbit target: two viewports can watch two different drones.
+    // Previously every OrbitPoint camera resolved the same scene-global first mover.
+    #[test]
+    fn two_viewports_orbit_independently() {
+        let scene = test_scene(&[("drone1", 0.0, true), ("drone2", 100.0, true)]);
+        let mut left = test_controller();
+        let mut right = test_controller();
+
+        left.switch_mode(&scene);
+        right.switch_mode(&scene);
+        assert_eq!(left.orbit_target(), Some(0), "both default to the first mover");
+        assert_eq!(right.orbit_target(), Some(0));
+
+        right.cycle_orbit_target(&scene);
+
+        assert_eq!(right.orbit_target(), Some(1));
+        assert_eq!(left.orbit_target(), Some(0), "cycling one viewport must not move the other");
+
+        // the targets are 100 apart, so proximity is proof the focus point actually rebound
+        // rather than only the index changing
+        assert!((orbit_position(&mut left) - Point3::new(0.0, 0.0, 0.0)).magnitude() < 6.0);
+        assert!((orbit_position(&mut right) - Point3::new(100.0, 0.0, 0.0)).magnitude() < 6.0);
+    }
+
+    // A viewport's target is its own setting, not a transient of the current mode — dipping into
+    // free roam to reposition and coming back should not silently retarget the scene default.
+    #[test]
+    fn orbit_target_survives_a_round_trip_through_free_roam() {
+        let scene = test_scene(&[("drone1", 0.0, true), ("drone2", 100.0, true)]);
+        let mut controller = test_controller();
+
+        controller.switch_mode(&scene);
+        controller.cycle_orbit_target(&scene);
+        assert_eq!(controller.orbit_target(), Some(1));
+
+        controller.switch_mode(&scene); // back to free roam
+        controller.switch_mode(&scene); // and into orbit again
+
+        assert_eq!(controller.orbit_target(), Some(1));
+        assert!((orbit_position(&mut controller) - Point3::new(100.0, 0.0, 0.0)).magnitude() < 6.0);
+    }
+
+    // The shape of golden_gate_scene.json: one static landmark, one drone. Cycling must reach the
+    // landmark — it is the more interesting thing to orbit, and restricting candidates to movers
+    // left T with nowhere to go and no visible effect at all.
+    #[test]
+    fn cycling_reaches_static_entities() {
+        let scene = test_scene(&[("Golden Gate Bridge", 0.0, false), ("Blizzard", 100.0, true)]);
+        let mut controller = test_controller();
+
+        controller.switch_mode(&scene);
+        assert_eq!(controller.orbit_target(), Some(1), "the mover is still the default");
+
+        controller.cycle_orbit_target(&scene);
+        assert_eq!(controller.orbit_target(), Some(0), "the static landmark is reachable");
+        assert!((orbit_position(&mut controller) - Point3::new(0.0, 0.0, 0.0)).magnitude() < 6.0);
+
+        controller.cycle_orbit_target(&scene);
+        assert_eq!(controller.orbit_target(), Some(1), "and it wraps back around");
+    }
+
+    // Cycling walks the scene in order, wrapping at the end.
+    #[test]
+    fn cycling_wraps_through_every_entity() {
+        let scene = test_scene(&[
+            ("prop", 0.0, false),
+            ("drone1", 100.0, true),
+            ("drone2", 200.0, true),
+        ]);
+        let mut controller = test_controller();
+
+        controller.switch_mode(&scene);
+        assert_eq!(controller.orbit_target(), Some(1), "first mover is the default");
+
+        for expected in [2, 0, 1, 2] {
+            controller.cycle_orbit_target(&scene);
+            assert_eq!(controller.orbit_target(), Some(expected));
+        }
+    }
+
+    // With nothing moving there is still something to look at: the default falls back to the
+    // first entity, preserving what the old scene-global search did.
+    #[test]
+    fn a_scene_of_static_entities_still_orbits() {
+        let scene = test_scene(&[("prop_a", 0.0, false), ("prop_b", 100.0, false)]);
+        let mut controller = test_controller();
+
+        controller.switch_mode(&scene);
+        assert_eq!(controller.orbit_target(), Some(0));
+
+        controller.cycle_orbit_target(&scene);
+        assert_eq!(controller.orbit_target(), Some(1));
+    }
+
+    // T is meaningless outside orbit mode. Acting anyway would change state the user cannot see,
+    // so a later Enter would drop them onto an entity they never chose.
+    #[test]
+    fn cycling_is_a_no_op_in_free_roam() {
+        let scene = test_scene(&[("drone1", 0.0, true), ("drone2", 100.0, true)]);
+        let mut controller = test_controller();
+
+        controller.cycle_orbit_target(&scene);
+
+        assert_eq!(controller.mode(), CameraMode::FreeRoam);
+        assert_eq!(controller.orbit_target(), None);
     }
 
     #[test]

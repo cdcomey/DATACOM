@@ -228,8 +228,26 @@ impl Entity {
         }
     }
 
+    /// A model-less entity, for tests that need a scene but not a GPU.
+    ///
+    /// Every other constructor takes a `wgpu::Device` — `new_child` does not, but it is private,
+    /// and callers outside this module have no way in. Camera tests in particular need a scene
+    /// of positioned, orbitable entities and nothing else.
+    #[cfg(test)]
+    pub fn for_test(name: &str, position: Point3<f32>, behavior: Option<Behavior>) -> Entity {
+        Entity::new_child(
+            name.to_string(),
+            position,
+            Quaternion::new(1.0, 0.0, 0.0, 0.0),
+            None,
+            behavior,
+        )
+    }
+
     pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout, registry: &ring_buffer::BufferRegistry) -> Entity {
-        let name = json["Name"].to_string();
+        // as_str, not to_string: Value::to_string on a JSON string keeps the quotes, and this
+        // name is displayed. The child branch below has always done it this way.
+        let name = json["Name"].as_str().unwrap_or("").to_string();
         debug!("loading entity {name}");
 
         let position_arr: Vec<f32> = json["Position"].as_array().unwrap()
@@ -320,6 +338,8 @@ impl Entity {
 
         Ok(Entity::new_root(name, position, rotation, scale, behavior, children, device, model_bind_group_layout))
     }
+
+    pub fn name(&self) -> &str { &self.name }
 
     pub fn get_position(&self) -> Rc<RefCell<Point3<f32>>> { Rc::clone(&self.position) }
 
