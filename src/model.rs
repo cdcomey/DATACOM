@@ -430,6 +430,14 @@ impl Rect {
         }
     }
 
+    /// Whether a window-space point falls inside this rect.
+    ///
+    /// `x`/`y` are the same top-left-origin physical pixels that `set_scissor_rect` takes and
+    /// that winit reports for the cursor, so a cursor position can be tested directly.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+
     fn get_border_corners(x: f32, y: f32, w: f32, h: f32, color: cgmath::Vector3<f32>) -> Vec<ModelVertex> {
         let color_arr = [color.x, color.y, color.z];
 

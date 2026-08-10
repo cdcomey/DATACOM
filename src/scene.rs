@@ -275,6 +275,9 @@ pub struct Scene {
     text_resources: text::TextResources,
     toasts: Vec<text::Toast>,
     pub viewports: Vec<Viewport>,
+    /// Index of the viewport that camera input is routed to. Always a valid index into
+    /// `viewports`, which is never empty — the loaders push a default when the JSON has none.
+    focused_viewport: usize,
     pub device: std::sync::Arc<Device>,
     pub queue: std::sync::Arc<Queue>,
     pub model_bind_group_layout: BindGroupLayout,
@@ -328,6 +331,7 @@ impl Scene {
             text_resources,
             toasts: Vec::new(),
             viewports,
+            focused_viewport: 0,
             device,
             queue,
             model_bind_group_layout,
@@ -359,6 +363,35 @@ impl Scene {
         ];
 
         text_objects
+    }
+
+    pub fn focused_viewport(&self) -> usize { self.focused_viewport }
+
+    /// The camera controller every input path in `state.rs` addresses.
+    pub fn focused_camera(&mut self) -> &mut camera::CameraController {
+        &mut self.viewports[self.focused_viewport].camera_controller
+    }
+
+    /// Index of the topmost viewport containing a window-space point, if any.
+    ///
+    /// Viewports overlap — a `FullScreen` one typically sits under several insets — and `draw`
+    /// paints them in order, so the *last* match is the one visible at that point. Searching in
+    /// reverse makes the hit test agree with what the user sees.
+    pub fn viewport_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.viewports.iter().rposition(|v| v.rect.contains(x, y))
+    }
+
+    /// Routes subsequent camera input to `index`, returning whether focus actually moved.
+    ///
+    /// Releases the outgoing viewport's held input, since it will never see the matching key-up.
+    pub fn focus_viewport(&mut self, index: usize) -> bool {
+        if index >= self.viewports.len() || index == self.focused_viewport {
+            return false;
+        }
+
+        self.viewports[self.focused_viewport].camera_controller.release_all_input();
+        self.focused_viewport = index;
+        true
     }
 
     /// Shows a message that holds at full opacity for a second, then fades out quickly.
@@ -843,8 +876,11 @@ impl Scene {
         self.entities.clear();
         ring_buffer::clear_registry(registry);
         // keep the first viewport rather than building a fresh one: it already owns a valid camera
-        // and bind groups, and index 0 is what the input handlers in state.rs address
+        // and bind groups
         self.viewports.truncate(1);
+        // the focused viewport may have just been dropped, and `focused_viewport` must stay a
+        // valid index — every input path indexes with it unchecked
+        self.focused_viewport = 0;
     }
 
     // returns how many entities were merged in, so callers can report whether a stream that

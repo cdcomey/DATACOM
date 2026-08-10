@@ -35,6 +35,10 @@ pub struct State<'a> {
     window: &'a Window,
     pub framerate: f32,
     pub mouse_pressed: bool,
+    /// Last known cursor position, in the same window space as `Viewport::rect`. Tracked
+    /// unconditionally so a click can hit-test the viewport under the cursor — `MouseInput`
+    /// carries no coordinates of its own.
+    cursor_position: winit::dpi::PhysicalPosition<f64>,
 }
 
 impl<'a> State<'a> {
@@ -478,6 +482,7 @@ impl<'a> State<'a> {
             window,
             framerate: 60.0,
             mouse_pressed: false,
+            cursor_position: winit::dpi::PhysicalPosition::new(0.0, 0.0),
         }
     }
 
@@ -506,9 +511,7 @@ impl<'a> State<'a> {
         match event {
             DeviceEvent::MouseMotion { delta } => {
                 if self.mouse_pressed {
-                    for viewport in &mut self.scene.viewports {
-                        viewport.camera_controller.process_mouse(delta.0, delta.1);
-                    }
+                    self.scene.focused_camera().process_mouse(delta.0, delta.1);
                 }
             }
             _ => {}
@@ -517,6 +520,19 @@ impl<'a> State<'a> {
         true
     }
     
+    /// Names a viewport for on-screen messages.
+    ///
+    /// A single-viewport scene has no ambiguity to resolve, so it stays "the camera" and the
+    /// messages read as they did before viewports were addressable. Otherwise the index is
+    /// the one from the scene JSON's `viewports` array, so a message points at a line of JSON.
+    fn describe_viewport(&self, index: usize) -> String {
+        if self.scene.viewports.len() < 2 {
+            "camera".to_string()
+        } else {
+            format!("viewport {}", index)
+        }
+    }
+
     pub fn window_input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput {
@@ -540,19 +556,24 @@ impl<'a> State<'a> {
                 // Watch the mode across the keypress rather than keying off Enter, so the
                 // message stays correct wherever the switch is triggered from, and never
                 // fires when `switch_mode` declines to switch.
-                let mode_before = self.scene.viewports[0].camera_controller.mode();
-                let handled = self.scene.viewports[0].camera_controller
+                //
+                // Indexed rather than routed through `focused_camera`, so the borrow stays
+                // scoped to `viewports` and `process_keyboard` can still take `&entities`.
+                let focused = self.scene.focused_viewport();
+                let mode_before = self.scene.viewports[focused].camera_controller.mode();
+                let handled = self.scene.viewports[focused].camera_controller
                     .process_keyboard(*key, *state, &self.scene.entities);
-                let mode_after = self.scene.viewports[0].camera_controller.mode();
+                let mode_after = self.scene.viewports[focused].camera_controller.mode();
 
                 if mode_after != mode_before {
-                    self.scene.show_toast(format!("Switched camera to {}", mode_after.display_name()));
+                    let target = self.describe_viewport(focused);
+                    self.scene.show_toast(format!("Switched {} to {}", target, mode_after.display_name()));
                 }
 
                 handled
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.scene.viewports[0].camera_controller.process_scroll(delta);
+                self.scene.focused_camera().process_scroll(delta);
                 true
             }
             WindowEvent::MouseInput {
@@ -561,13 +582,32 @@ impl<'a> State<'a> {
                 ..
             } => {
                 self.mouse_pressed = *state == ElementState::Pressed;
+
+                // Focus follows the click, not the drag: picking on press means the whole
+                // drag that follows belongs to one viewport, even if it leaves that viewport's
+                // bounds. A click outside every viewport leaves focus where it is.
+                if self.mouse_pressed {
+                    if let Some(hit) = self.scene.viewport_at(
+                        self.cursor_position.x as f32,
+                        self.cursor_position.y as f32,
+                    ) {
+                        if self.scene.focus_viewport(hit) {
+                            let target = self.describe_viewport(hit);
+                            let mode = self.scene.viewports[hit].camera_controller.mode();
+                            self.scene.show_toast(format!("Controlling {} ({})", target, mode.display_name()));
+                        }
+                    }
+                }
+
                 true
             }
             WindowEvent::CursorMoved {
                 position,
                 ..
-            } if self.mouse_pressed => {
-                // println!("mouse pressed at ({}, {})", position.x, position.y);
+            } => {
+                // Tracked on every move, not just while dragging: the position has to be
+                // current the instant the button goes down for the hit test above to work.
+                self.cursor_position = *position;
 
                 true
             }

@@ -223,6 +223,25 @@ impl CameraController {
         state == ElementState::Pressed
     }
 
+    /// Drops every in-flight input, as if the user had let go of everything.
+    ///
+    /// Called on the viewport losing focus. Input is routed to one viewport at a time, so a
+    /// controller that is focused while a key is held never sees that key's `Released` event
+    /// once focus moves on — it would keep the key in `pressed_keys` and translate forever.
+    /// The rotate accumulators go too: only `update_camera_freeroam` zeroes them, so a
+    /// controller blurred while orbiting would otherwise apply a stale mouse delta as a
+    /// one-frame kick whenever it next returned to free roam.
+    pub fn release_all_input(&mut self) {
+        self.pressed_keys.clear();
+        self.h_translate_step = 0.0;
+        self.l_translate_step = 0.0;
+        self.v_translate_step = 0.0;
+        self.l_rotate_step = 0.0;
+        self.rotate_horizontal = 0.0;
+        self.rotate_vertical = 0.0;
+        self.scroll = 0.0;
+    }
+
     pub fn process_mouse(&mut self, mouse_dx: f64, mouse_dz: f64) {
         self.rotate_horizontal = mouse_dx as f32;
         self.rotate_vertical = mouse_dz as f32;
@@ -428,6 +447,45 @@ mod tests {
             CameraMode::FreeRoam,
             "a scene with no entities has nothing to orbit, so the mode must not change",
         );
+    }
+
+    // Input is routed to one viewport at a time, so a controller that loses focus with a key
+    // held never receives that key's Released event. Without the explicit release it would
+    // translate forever, on a viewport the user is no longer even addressing.
+    #[test]
+    fn a_blurred_controller_stops_moving() {
+        let mut controller = test_controller();
+        let dt = Duration::from_millis(16);
+        controller.process_keyboard(KeyCode::KeyW, ElementState::Pressed, &vec![]);
+
+        // premise: the held key does drive movement, so the assertion below means something
+        controller.update_camera(dt);
+        assert_ne!(controller.camera().position, Point3::new(0.0, 0.0, 0.0));
+
+        let drifted_to = controller.camera().position;
+        controller.release_all_input();
+        controller.update_camera(dt);
+
+        assert!(controller.pressed_keys.is_empty(), "the held key must not survive the blur");
+        assert_eq!(
+            controller.camera().position, drifted_to,
+            "a viewport that lost focus mid-keypress must stop where it was",
+        );
+    }
+
+    // Only update_camera_freeroam zeroes the rotate accumulators, so a controller blurred while
+    // orbiting would keep the last mouse delta and apply it as a kick on returning to free roam.
+    #[test]
+    fn release_all_input_clears_pending_rotation() {
+        let mut controller = test_controller();
+        controller.process_mouse(5.0, -3.0);
+        assert_ne!(controller.rotate_horizontal, 0.0);
+
+        controller.release_all_input();
+
+        assert_eq!(controller.rotate_horizontal, 0.0);
+        assert_eq!(controller.rotate_vertical, 0.0);
+        assert_eq!(controller.scroll, 0.0);
     }
 
     #[test]
