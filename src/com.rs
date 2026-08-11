@@ -123,6 +123,19 @@ impl ServerCommand {
     }
 }
 
+/// Builds the `COMMAND` frame that carries `command`.
+///
+/// The sole construction site for a command frame, mirroring `MessageType::to_be_bytes`: the frame
+/// is small enough that hand-assembling it at each sender looks harmless, and a sender that laid
+/// the two fields out differently would decode as a valid frame carrying the wrong command rather
+/// than as an error.
+pub fn encode_command(command: ServerCommand) -> [u8; COMMAND_BYTE_WIDTH] {
+    let mut frame = [0u8; COMMAND_BYTE_WIDTH];
+    frame[0..MESSAGE_TYPE_BYTE_WIDTH].copy_from_slice(&MessageType::COMMAND.to_be_bytes());
+    frame[MESSAGE_TYPE_BYTE_WIDTH..COMMAND_BYTE_WIDTH].copy_from_slice(&command.to_be_bytes());
+    frame
+}
+
 // object to be used in assembler thread's hash maps
 // stores information about a file in the middle of being transmitted across a stream
 // contains basic info, a Box for an arbitrary amount of data stored
@@ -293,7 +306,10 @@ pub enum ReceiveOutcome {
 // thread — so a scene that omits it, sets it to anything other than a JSON bool, or fails to parse
 // at all simply yields false. Declaring is opt-in precisely so a peer fleet, where no stream is an
 // operator, ends up with no authority rather than an arbitrary one.
-fn scene_declares_authority(data: &[u8]) -> bool {
+/// Public so a server can ask the same question of the scene it is about to send, and reach the
+/// same answer the client will — a server that sends commands its scene never claimed the right to
+/// issue is a misconfiguration best caught on the sending side.
+pub fn scene_declares_authority(data: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(data)
         .ok()
         .and_then(|scene| scene["authority"].as_bool())
@@ -997,6 +1013,22 @@ mod tests {
 
         assert!(matches!(outcome, ReceiveOutcome::Nothing));
         assert_eq!(buf.len(), MESSAGE_TYPE_BYTE_WIDTH, "the type field waits for its payload");
+    }
+
+    // The encoder and the decoder are the two halves of one frame layout, written in different
+    // files. A field width or order that drifted on one side would still decode here as a valid
+    // frame carrying the wrong command, so pin them against each other rather than separately.
+    #[test]
+    fn an_encoded_command_decodes_back_to_itself() {
+        for command in [ServerCommand::CLEAR_SCENE] {
+            let (outcome, buf) = dispatch_buffered_frame(encode_command(command).to_vec());
+
+            match outcome {
+                ReceiveOutcome::Command(decoded) => assert_eq!(decoded, command),
+                _ => panic!("{:?} did not encode to a command frame", command),
+            }
+            assert!(buf.is_empty(), "the frame is exactly {} bytes", COMMAND_BYTE_WIDTH);
+        }
     }
 
     #[test]

@@ -312,6 +312,24 @@ merged and then wiped. The server is not told, and a scene is sent only once per
 count in the client's `cleared the scene (N entities removed)` log line is the only record that it
 happened.
 
+#### Issuing a clear from the test server
+
+The built-in test server can send one, so the path can be exercised without an external operator.
+Give the scene it transmits a top-level `"authority": true` and set the delay, in whole seconds:
+
+```bash
+DATACOM_TEST_CLEAR_AFTER_SECS=10 cargo run -- test scene_a.json n
+```
+
+The delay is measured from that server's own `TRANSMISSION_END` rather than from startup, so the
+command lands in the live phase however long the initial transfer took. Each server checks its own
+scene first and logs — rather than sends — when that scene does not declare authority, since the
+client would ignore the command and the reason belongs on the side that has to change. It is one
+command per run: a scene is sent once per stream, so nothing repopulates what the clear removed.
+
+The trigger is an environment variable because test mode's arguments are already fully spoken for —
+the trailing one is the record-video flag and the rest are the JSON list.
+
 Note that this is a coordination mechanism, not a security one: the wire protocol is unauthenticated,
 so authority prevents conflicting or accidental global commands, not hostile ones.
 

@@ -9,7 +9,18 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::com::{MAX_FILE_NAME_BYTE_WIDTH, MessageType, get_ports, has_timed_out};
+use crate::com::{
+    MAX_FILE_NAME_BYTE_WIDTH, MessageType, ServerCommand, encode_command, get_ports,
+    scene_declares_authority,
+};
+
+/// Environment variable that schedules a `CLEAR_SCENE` in test mode: a whole number of seconds
+/// after this server finishes its own transmission.
+///
+/// An environment variable rather than an argument because test mode already consumes its trailing
+/// argument as the record-video flag and its middle ones as the JSON list, leaving nowhere to put
+/// this without changing what an existing command line means.
+const CLEAR_SCENE_DELAY_VAR: &str = "DATACOM_TEST_CLEAR_AFTER_SECS";
 
 #[derive(Clone)]
 pub enum StreamMode {
@@ -161,6 +172,67 @@ fn send_streaming_data(
     socket.send(&buf).unwrap();
 }
 
+/// How long to wait before issuing `CLEAR_SCENE`, or `None` to never issue one.
+///
+/// Unset means never, deliberately: a clear that fired on every test run would wipe the scene a
+/// person is trying to look at, and the emptied window is indistinguishable from a stream that
+/// stopped arriving. A malformed value is reported rather than treated as zero — silently clearing
+/// immediately is the worst reading of a typo.
+fn clear_scene_delay() -> Option<Duration> {
+    let raw = std::env::var(CLEAR_SCENE_DELAY_VAR).ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            info!("ignoring {}={:?}: expected a whole number of seconds", CLEAR_SCENE_DELAY_VAR, raw);
+            None
+        }
+    }
+}
+
+/// Sends one `CLEAR_SCENE` on a timer from its own thread.
+///
+/// A thread rather than a sleep in the streaming loop because that loop never returns for a
+/// generated source — there is no later point in it to reach. The socket is already connected to
+/// the client, so this shares it rather than opening another.
+///
+/// Sent once. A scene is transmitted once per stream, so nothing re-populates what the clear
+/// removes and a repeat would land on an already-empty scene.
+fn spawn_clear_scene_timer(socket: Arc<UdpSocket>, delay: Duration) {
+    thread::Builder::new()
+        .name("server clear-scene timer".to_string())
+        .spawn(move || {
+            thread::sleep(delay);
+            info!("S: sending CLEAR_SCENE");
+            if let Err(e) = socket.send(&encode_command(ServerCommand::CLEAR_SCENE)) {
+                info!("S: CLEAR_SCENE was not sent: {}", e);
+            }
+        })
+        .unwrap();
+}
+
+/// Schedules the clear only if this server's own scene claims authority, mirroring the rule the
+/// client enforces.
+///
+/// Sending it regardless would work — the client ignores commands from a stream without authority
+/// — but the symptom of a missing declaration would then be a scene that simply does not clear,
+/// with the explanation only in the client's log. Checked here so the reason is visible on the
+/// side that has to be fixed.
+fn schedule_clear_scene(socket: &Arc<UdpSocket>, scene_path: &str) {
+    let Some(delay) = clear_scene_delay() else { return };
+
+    let full_path = format!("data/scene_loading/{}", scene_path);
+    if fs::read(&full_path).map(|scene| scene_declares_authority(&scene)).unwrap_or(false) {
+        info!("S: {} holds command authority; CLEAR_SCENE in {:?}", scene_path, delay);
+        spawn_clear_scene_timer(Arc::clone(socket), delay);
+    } else {
+        info!(
+            "S: not scheduling CLEAR_SCENE — {} does not set \"authority\": true, so the client \
+             would ignore the command",
+            scene_path,
+        );
+    }
+}
+
 pub fn create_server_thread(
     file: String,
     json_file_paths: Vec<String>,
@@ -223,6 +295,12 @@ pub fn create_server_thread(
                     .unwrap();
 
                 send_finite_test_data(&*socket, &json_file_path, addr);
+
+                // Timed from here rather than from the thread starting, so the delay is measured
+                // against the live phase the client will actually honour a command in: anything
+                // sent before this server's TRANSMISSION_END is dropped as initial-transfer noise.
+                schedule_clear_scene(&socket, &json_file_path);
+
                 thread::sleep(Duration::from_secs(1));
 
                 match mode_i {
