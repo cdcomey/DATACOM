@@ -128,6 +128,10 @@ impl Behavior {
     pub fn is_exhausted(&self) -> bool {
         self.stream.as_ref().map_or(true, |s| s.is_exhausted())
     }
+
+    pub fn stream_source(&self) -> Option<&str> {
+        self.stream.as_ref().and_then(|s| s.source_name())
+    }
 }
 
 #[allow(dead_code)]
@@ -474,6 +478,17 @@ impl Entity {
         self.run_own_behavior(data_counter);
         for child in &mut self.children {
             child.run_own_behavior(data_counter);
+        }
+    }
+
+    /// Appends `(source name, description)` for every live stream this entity and its children
+    /// read, so the scene can spot two consumers sharing one buffer.
+    pub fn collect_stream_sources(&self, out: &mut Vec<(String, String)>) {
+        if let Some(name) = self.behavior.as_ref().and_then(|b| b.stream_source()) {
+            out.push((name.to_string(), format!("entity '{}'", self.name)));
+        }
+        for child in &self.children {
+            child.collect_stream_sources(out);
         }
     }
 

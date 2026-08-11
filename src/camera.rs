@@ -181,6 +181,11 @@ impl CameraController {
         self.mode = CameraMode::Stream;
     }
 
+    /// The registry key this camera reads, if it is stream-driven.
+    pub fn stream_source(&self) -> Option<&str> {
+        self.stream.as_ref().and_then(|s| s.source_name())
+    }
+
     /// Re-binds a stream-driven camera to the registry after a purge. See
     /// `TransformStream::rebind` for why the surviving viewport needs this and entities do not.
     pub fn rebind_stream(&mut self, registry: &ring_buffer::BufferRegistry) {

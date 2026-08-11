@@ -44,6 +44,31 @@ impl BorderAlignment {
     }
 }
 
+/// Groups `(source, consumer)` pairs by source, keeping only the sources with several consumers.
+///
+/// Order is stable — sources in first-seen order, consumers in the order given — so the warning
+/// text does not shuffle between runs of the same scene.
+fn find_shared_sources(consumers: &[(String, String)]) -> Vec<(String, Vec<String>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    for (source, consumer) in consumers {
+        let entry = grouped.entry(source.clone()).or_insert_with(|| {
+            order.push(source.clone());
+            Vec::new()
+        });
+        entry.push(consumer.clone());
+    }
+
+    order.into_iter()
+        .filter(|source| grouped[source].len() > 1)
+        .map(|source| {
+            let sharers = grouped[&source].clone();
+            (source, sharers)
+        })
+        .collect()
+}
+
 pub struct Viewport {
     pub rect: model::Rect,
     aspect_ratio: f32,
@@ -689,7 +714,7 @@ impl Scene {
             entity_vec.push(Entity::load_from_json(*i, &device, &model_bind_group_layout, &registry));
         }
 
-        Scene::new(
+        let scene = Scene::new(
             entity_vec,
             total_timesteps,
             None,
@@ -704,7 +729,10 @@ impl Scene {
             text_bind_group_layout,
             screen_width,
             screen_height,
-        )
+        );
+
+        scene.warn_on_shared_stream_sources();
+        scene
     }
 
     // pub fn load_scene_from_network(
@@ -868,6 +896,39 @@ impl Scene {
         self.data_counter > self.total_timesteps
     }
 
+    /// Logs a warning for every stream source read by more than one consumer.
+    ///
+    /// Two consumers bound to one name share a single `SharedBuffer`, and `next_frame` *drains*
+    /// what it reads — so they do not both see the stream, they take alternate frames and each
+    /// runs at half speed. Nothing errors; the motion just looks wrong.
+    ///
+    /// This is the likely mistake for the feature that motivated stream cameras: pointing a chase
+    /// camera at the same `.bin` as the drone it follows reads as the obvious thing to write, and
+    /// is exactly the thing that breaks. Give each consumer its own name and have the server send
+    /// the frames twice.
+    pub fn warn_on_shared_stream_sources(&self) {
+        let mut consumers: Vec<(String, String)> = Vec::new();
+
+        for (i, viewport) in self.viewports.iter().enumerate() {
+            if let Some(name) = viewport.camera_controller.stream_source() {
+                consumers.push((name.to_string(), format!("viewport {} camera", i)));
+            }
+        }
+        for entity in &self.entities {
+            entity.collect_stream_sources(&mut consumers);
+        }
+
+        for (source, sharers) in find_shared_sources(&consumers) {
+            log::warn!(
+                "stream '{}' is read by {} consumers ({}) — they will take alternate frames and \
+                 each run at a fraction of the intended rate; give each its own source name",
+                source,
+                sharers.len(),
+                sharers.join(", "),
+            );
+        }
+    }
+
     /// Whether every entity stream has run dry — the network path's signal that a run is over.
     ///
     /// Deliberately ignores stream-driven cameras. A camera holding its last pose between packets
@@ -913,10 +974,34 @@ impl Scene {
     // connected actually contributed anything to the scene
     pub fn append_entities_from_json_str(&mut self, json_str: &str, registry: &ring_buffer::BufferRegistry) -> usize {
         let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
+
+        // Only the first scene to arrive defines viewports, so anything declared here is dropped.
+        // Silently ignoring it is the constraint most likely to waste someone's time: a camera
+        // stream declared on a losing scene simply never happens, with nothing to show why.
+        if let Some(viewports) = json["viewports"].as_array() {
+            if !viewports.is_empty() {
+                let streamed = viewports.iter()
+                    .filter(|v| v["camera"]["stream"].is_string())
+                    .count();
+                log::warn!(
+                    "ignoring {} viewport definition(s) from a merged scene ({} with a camera \
+                     stream) — only the first scene to arrive defines viewports; declare them in \
+                     every scene if which one arrives first is not deterministic",
+                    viewports.len(),
+                    streamed,
+                );
+            }
+        }
+
         let Some(entity_array) = json["entities"].as_array() else { return 0 };
         for e in entity_array {
             self.entities.push(Entity::load_from_json(e, &self.device, &self.model_bind_group_layout, registry));
         }
+
+        // Re-run after the merge rather than only at load: a stream camera declared by the first
+        // scene collides with an entity that only arrives now.
+        self.warn_on_shared_stream_sources();
+
         entity_array.len()
     }
 
@@ -1048,5 +1133,72 @@ impl Scene {
         } else {
             eprintln!("ffmpeg failed with status: {:?}", status)
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+        raw.iter().map(|(s, c)| (s.to_string(), c.to_string())).collect()
+    }
+
+    #[test]
+    fn distinct_sources_do_not_collide() {
+        let consumers = pairs(&[
+            ("drone1.bin", "entity 'Drone_01'"),
+            ("chase_cam.bin", "viewport 0 camera"),
+        ]);
+
+        assert!(find_shared_sources(&consumers).is_empty());
+    }
+
+    // The mistake the warning exists for: aiming a chase camera at the drone's own stream. Both
+    // drain the one buffer, so each sees every other frame.
+    #[test]
+    fn a_camera_sharing_an_entitys_source_is_reported() {
+        let consumers = pairs(&[
+            ("drone1.bin", "viewport 1 camera"),
+            ("drone1.bin", "entity 'Drone_01'"),
+        ]);
+
+        let shared = find_shared_sources(&consumers);
+
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].0, "drone1.bin");
+        assert_eq!(shared[0].1, vec!["viewport 1 camera", "entity 'Drone_01'"]);
+    }
+
+    #[test]
+    fn every_colliding_source_is_reported_once_with_all_sharers() {
+        let consumers = pairs(&[
+            ("a.bin", "entity 'A'"),
+            ("b.bin", "entity 'B'"),
+            ("a.bin", "viewport 0 camera"),
+            ("a.bin", "viewport 2 camera"),
+            ("c.bin", "entity 'C'"),
+        ]);
+
+        let shared = find_shared_sources(&consumers);
+
+        assert_eq!(shared.len(), 1, "only a.bin is shared");
+        assert_eq!(shared[0].1.len(), 3);
+    }
+
+    // Warning text that reorders between runs of the same scene is hard to diff and reads as if
+    // something changed when nothing did.
+    #[test]
+    fn report_order_follows_first_appearance() {
+        let consumers = pairs(&[
+            ("z.bin", "entity 'Z1'"),
+            ("a.bin", "entity 'A1'"),
+            ("z.bin", "entity 'Z2'"),
+            ("a.bin", "entity 'A2'"),
+        ]);
+
+        let sources: Vec<String> = find_shared_sources(&consumers)
+            .into_iter().map(|(s, _)| s).collect();
+
+        assert_eq!(sources, vec!["z.bin", "a.bin"]);
     }
 }

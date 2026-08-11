@@ -157,6 +157,12 @@ impl TransformStream {
         buffer_empty && self.data.len() < DATA_ARR_WIDTH
     }
 
+    /// The registry key this stream reads, if it is a live one. `None` for the eager sources,
+    /// which have no shared buffer and so cannot collide with anything.
+    pub fn source_name(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
     /// How many f32 remain in hand. Zero for a live stream, whose total is unknowable — callers
     /// sizing a progress bar want the eager sources only.
     pub fn remaining(&self) -> usize {
