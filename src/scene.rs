@@ -15,6 +15,17 @@ use model::DrawModel;
 const BYTES_PER_PIXEL: u32 = 4;
 const NUM_CAPTURE_BUFFERS: usize = 3;
 
+/// Frame rate `ffmpeg` is told to assume while frames are still arriving.
+///
+/// The real capture rate is only known once recording stops, but `-r` has to be fixed when the
+/// process spawns — so frames are encoded against this and the container is retimed afterwards.
+/// See `VideoEncoder::retime`.
+const NOMINAL_CAPTURE_FPS: f64 = 60.0;
+
+/// Scratch file the streaming encode writes to before it is retimed into `CAPTURE_OUTPUT_PATH`.
+const RAW_CAPTURE_PATH: &str = "capture_raw.mp4";
+const CAPTURE_OUTPUT_PATH: &str = "output.mp4";
+
 /// Pixel height the glyph atlas is rasterized at.
 const FONT_SIZE: f32 = 100.0;
 /// Viewport-local baseline position for toasts, below the FPS counter at (30, 100).
@@ -327,8 +338,125 @@ pub struct Scene {
     data_counter: Option<usize>,
     frame_counter: usize,
     capture_buffers: Vec<wgpu::Buffer>,
-    screen_recordings: Vec<Vec<u8>>,
+    /// Spawned on the first frame read back, so recording costs a fixed amount of memory rather
+    /// than growing with run length. `None` until then, and again once `finish_capture` has run.
+    encoder: Option<VideoEncoder>,
     capture_duration: std::time::Duration,
+}
+
+/// A running `ffmpeg` process being fed frames as they come off the GPU.
+///
+/// Frames are handed over one at a time and never collected, which is the whole point of this
+/// type. Raw BGRA is ~8 MB a frame at 1080p, so buffering a run in memory and encoding at exit
+/// costs gigabytes — 15 seconds at 60 fps is about 7 GB. Streaming into `ffmpeg` instead holds
+/// resident memory at the `NUM_CAPTURE_BUFFERS` staging buffers no matter how long recording runs.
+struct VideoEncoder {
+    process: std::process::Child,
+    stdin: std::process::ChildStdin,
+    frames_written: usize,
+}
+
+impl VideoEncoder {
+    /// Starts `ffmpeg` reading raw frames from stdin into `RAW_CAPTURE_PATH`.
+    fn spawn(width: u32, height: u32) -> Self {
+        let size_arg = format!("{}x{}", width, height);
+        let rate_arg = format!("{:.3}", NOMINAL_CAPTURE_FPS);
+
+        let mut process = Command::new("ffmpeg")
+            .args(&[
+                "-f", "rawvideo", //    input is raw video pixels
+                "-pix_fmt", "bgra", //  BGRA format (wgpu surface on macOS is Bgra8Unorm)
+                "-s", &size_arg, //     dimensions (actual capture resolution)
+                "-r", &rate_arg, //     provisional; corrected by `retime` once the real rate is known
+                "-i", "pipe:0", //      read input from stdin
+                "-c:v", "libx264", //   specify video codex
+                "-pix_fmt", "yuv420p",
+                "-preset", "fast", // fast encoding preset
+                "-movflags", "faststart", // optimize for streaming
+                "-y", // overwrite output file
+                RAW_CAPTURE_PATH,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("ffmpeg process failed to execute");
+
+        let stdin = process.stdin.take().expect("failed to extract stdin from ffmpeg process");
+
+        VideoEncoder { process, stdin, frames_written: 0 }
+    }
+
+    fn write_frame(&mut self, frame: &[u8]) {
+        self.stdin.write_all(frame).expect("failed to write input to ffmpeg process");
+        self.frames_written += 1;
+    }
+
+    /// Closes the encode and retimes the result to the rate frames actually arrived at.
+    fn finish(self, measured_fps: f64) {
+        let VideoEncoder { mut process, stdin, .. } = self;
+
+        // Dropping stdin closes the pipe, which is what tells ffmpeg to flush and exit. Without
+        // this the wait below blocks forever.
+        drop(stdin);
+
+        let status = process.wait().unwrap();
+
+        if !status.success() {
+            eprintln!("ffmpeg failed with status: {:?}", status);
+            return;
+        }
+
+        VideoEncoder::retime(measured_fps);
+    }
+
+    /// Rewrites `RAW_CAPTURE_PATH` into `CAPTURE_OUTPUT_PATH` at the measured capture rate.
+    ///
+    /// The encode ran against `NOMINAL_CAPTURE_FPS` because `-r` is fixed at spawn time, so the
+    /// timestamps in the raw file are wrong by whatever the two rates differ by. `-itsscale` with
+    /// `-c copy` scales them without touching the encoded frames — a file copy rather than a
+    /// re-encode.
+    fn retime(measured_fps: f64) {
+        let scale = NOMINAL_CAPTURE_FPS / measured_fps;
+
+        // A rename is exact and free, so only pay for the remux when the rates actually differ.
+        // Also the fallback when the measured rate is unusable, where scaling would be nonsense.
+        if !measured_fps.is_finite() || measured_fps <= 0.0 || (scale - 1.0).abs() < 0.01 {
+            match std::fs::rename(RAW_CAPTURE_PATH, CAPTURE_OUTPUT_PATH) {
+                Ok(()) => println!("video successfully converted!"),
+                Err(e) => eprintln!("failed to move {} to {}: {}", RAW_CAPTURE_PATH, CAPTURE_OUTPUT_PATH, e),
+            }
+            return;
+        }
+
+        let scale_arg = format!("{:.6}", scale);
+
+        let status = Command::new("ffmpeg")
+            .args(&[
+                "-itsscale", &scale_arg, // stretch input timestamps to the real capture rate
+                "-i", RAW_CAPTURE_PATH,
+                "-c", "copy", //          retime the container only; do not re-encode
+                "-movflags", "faststart",
+                "-y",
+                CAPTURE_OUTPUT_PATH,
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("ffmpeg retime process failed to execute");
+
+        if status.success() {
+            println!("video successfully converted! ({:.3} fps)", measured_fps);
+            let _ = std::fs::remove_file(RAW_CAPTURE_PATH);
+        } else {
+            // Left in place deliberately — the frames are fine, only the timing is off, and a
+            // playable file at the wrong rate beats deleting the whole capture.
+            eprintln!(
+                "ffmpeg retime failed with status: {:?}; raw capture left at {}",
+                status, RAW_CAPTURE_PATH,
+            );
+        }
+    }
 }
 
 impl Scene {
@@ -358,8 +486,6 @@ impl Scene {
             (Into::<u64>::into(BYTES_PER_PIXEL) * ((screen_width * screen_height) as u64)) as wgpu::BufferAddress
         );
 
-        let screen_recordings = Vec::new();
-
         debug!("created Scene");
 
         Scene {
@@ -381,7 +507,7 @@ impl Scene {
             data_counter,
             frame_counter,
             capture_buffers,
-            screen_recordings,
+            encoder: None,
             capture_duration: std::time::Duration::ZERO,
         }
     }
@@ -868,14 +994,20 @@ impl Scene {
             let index = self.frame_counter % NUM_CAPTURE_BUFFERS;
             // read buf n
             if self.frame_counter > NUM_CAPTURE_BUFFERS {
-                let mut saved_frames = Scene::read_capture_buf(
-                    device, 
-                    &self.capture_buffers, 
-                    width, 
+                let frame = Scene::read_capture_buf(
+                    device,
+                    &self.capture_buffers,
+                    width,
                     height,
                     index,
                 ).expect("Error in State::update(); failed to capture screen data in buffer");
-                self.screen_recordings.append(&mut saved_frames);
+                // Straight out to ffmpeg rather than collected — see `VideoEncoder`. Spawned here
+                // rather than in `Scene::new` because this is the first point the capture
+                // resolution is known, and because a run that records nothing should not leave a
+                // stray process or an empty file behind.
+                self.encoder
+                    .get_or_insert_with(|| VideoEncoder::spawn(width, height))
+                    .write_frame(&frame);
             }
 
             // write to buf n
@@ -1004,22 +1136,33 @@ impl Scene {
         entity_array.len()
     }
 
+    /// Flushes the staging buffers, closes the encode, and retimes the result.
+    ///
+    /// Taking the encoder up front makes this idempotent, which matters because the event loops
+    /// reach it by two routes — the close request and capture completion — and a run can hit both.
+    /// It also keeps the tail flush below from spawning a fresh encoder on a second call.
     pub fn finish_capture(&mut self, width: u32, height: u32) {
+        let Some(mut encoder) = self.encoder.take() else {
+            println!("no frames were captured; nothing to encode");
+            return;
+        };
+
         let device = self.device.clone();
-        self.read_remaining_buffers(&device, width, height);
-        let frame_count = self.screen_recordings.len();
+        Scene::read_remaining_buffers(&device, &self.capture_buffers, &mut encoder, self.frame_counter, width, height);
+
+        let frame_count = encoder.frames_written;
         println!("{} total frames recorded", frame_count);
 
         // Derive the average capture framerate from wall-clock time spent recording,
-        // falling back to 60 fps if we somehow have no timing data.
+        // falling back to the nominal rate if we somehow have no timing data.
         let elapsed_secs = self.capture_duration.as_secs_f64();
         let fps = if frame_count > 0 && elapsed_secs > 0.0 {
             frame_count as f64 / elapsed_secs
         } else {
-            60.0
+            NOMINAL_CAPTURE_FPS
         };
 
-        Scene::save_screen_data_to_file(&self.screen_recordings, width, height, fps);
+        encoder.finish(fps);
     }
 
     fn write_screen_to_capture_buf(device: &Device, queue: &Queue, texture: &wgpu::Texture, capture_buffers: &mut Vec<wgpu::Buffer>, width: u32, height: u32, index: usize){
@@ -1059,9 +1202,9 @@ impl Scene {
         queue.submit(Some(encoder.finish()));
     }
 
-    fn read_capture_buf(device: &Device, capture_buffers: &Vec<wgpu::Buffer>, width: u32, height: u32, index: usize) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    /// Maps one staging buffer and returns its frame with the row padding stripped.
+    fn read_capture_buf(device: &Device, capture_buffers: &Vec<wgpu::Buffer>, width: u32, height: u32, index: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let padded_bytes_per_row = ((width * BYTES_PER_PIXEL + 255) / 256) * 256;
-        let mut output = Vec::new();
 
         let buffer = &capture_buffers[index];
         let buffer_slice = buffer.slice(..);
@@ -1079,60 +1222,25 @@ impl Scene {
 
         drop(data);
         buffer.unmap();
-        output.push(pixels);
 
         // println!("read from buffer[{}]", index);
 
-        Ok(output)
+        Ok(pixels)
     }
 
-    fn read_remaining_buffers(&mut self, device: &Device, width: u32, height: u32){
+    /// Drains the frames still sitting in the staging buffers when recording stops.
+    ///
+    /// Takes the encoder rather than reaching for `self.encoder` so it cannot spawn one; by the
+    /// time this runs the encoder has been taken out of the scene and is on its way to being
+    /// closed.
+    fn read_remaining_buffers(device: &Device, capture_buffers: &Vec<wgpu::Buffer>, encoder: &mut VideoEncoder, frame_counter: usize, width: u32, height: u32){
         for i in 0..NUM_CAPTURE_BUFFERS {
-            let index = (self.frame_counter + i) % NUM_CAPTURE_BUFFERS;
-            let mut saved_frame = Scene::read_capture_buf(device, &self.capture_buffers, width, height, index).expect("problem with reading final few buffers");
-            self.screen_recordings.append(&mut saved_frame);
+            let index = (frame_counter + i) % NUM_CAPTURE_BUFFERS;
+            let frame = Scene::read_capture_buf(device, capture_buffers, width, height, index).expect("problem with reading final few buffers");
+            encoder.write_frame(&frame);
         }
     }
 
-    fn save_screen_data_to_file(screen_data: &Vec<Vec<u8>>, width: u32, height: u32, fps: f64){
-        let size_arg = format!("{}x{}", width, height);
-        let rate_arg = format!("{:.3}", fps);
-
-        let mut ffmpeg_process = Command::new("ffmpeg")
-            .args(&[
-                "-f", "rawvideo", //    input is raw video pixels
-                "-pix_fmt", "bgra", //  BGRA format (wgpu surface on macOS is Bgra8Unorm)
-                "-s", &size_arg, //     dimensions (actual capture resolution)
-                "-r", &rate_arg, //     fps (measured average capture framerate)
-                "-i", "pipe:0", //      read input from stdin
-                "-c:v", "libx264", //   specify video codex
-                "-pix_fmt", "yuv420p",
-                "-preset", "fast", // fast encoding preset
-                "-movflags", "faststart", // optimize for streaming
-                "-y", // overwrite output file
-                "output.mp4",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("ffmpeg process failed to execute");
-
-        let mut stdin = ffmpeg_process.stdin.take().expect("failed to extract stdin from ffmpeg process");
-
-        for frame in screen_data {
-            stdin.write_all(frame).expect("failed to write input to ffmpeg process");
-        }
-        drop(stdin);
-
-        let status = ffmpeg_process.wait().unwrap();
-
-        if status.success() {
-            println!("video successfully converted!");
-        } else {
-            eprintln!("ffmpeg failed with status: {:?}", status)
-        }
-    }
 }
 #[cfg(test)]
 mod tests {
