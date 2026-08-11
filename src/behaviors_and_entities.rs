@@ -4,12 +4,12 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::Path;
 use std::fs::OpenOptions;
-use std::sync::{Arc, Mutex};
 use log::{debug, info, error};
 use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
 use ndarray::{ArrayBase, OwnedRepr, Dim};
 
 use crate::ring_buffer;
+use crate::transform_stream::{self, TransformStream};
 
 use wgpu::util::DeviceExt;
 
@@ -17,9 +17,9 @@ use crate::model;
 
 use model::DrawModel;
 
-pub const DATA_ARR_WIDTH: usize = 12;
+pub use crate::transform_stream::DATA_ARR_WIDTH;
+
 const AVERAGE_REFRESH_RATE: usize = 16;
-const F32_SIZE: usize = std::mem::size_of::<f32>();
 const CHUNK_LENGTH: u64 = 1024;
 const MAX_TRAIL_LENGTH: usize = 500;
 
@@ -68,58 +68,43 @@ impl BehaviorType {
 
 pub struct Behavior {
     pub behavior_type: BehaviorType,
+    /// Parameters for the constant behaviors — `Translate` and `Rotate` read the first few slots
+    /// fresh every frame and never consume them. Frame data for `ChangeTransform` lives in
+    /// `stream` instead; the two roles used to share this field.
     pub data: Vec<f32>,
-    pub is_constant_behavior: bool,
-    data_buffer: Option<ring_buffer::SharedBuffer>,
+    /// Present exactly for the behaviors that consume frame data, which is what "not a constant
+    /// behavior" used to mean. A cached `is_constant_behavior` flag became redundant once the
+    /// distinction was structural, and could only ever disagree with `behavior_type`.
+    stream: Option<TransformStream>,
 }
 
 impl Behavior {
-    pub fn new(behavior_type: BehaviorType, data: Vec<f32>, data_buffer: Option<ring_buffer::SharedBuffer>) -> Behavior {
-        let is_constant_behavior = BehaviorType::is_constant_behavior(behavior_type);
+    pub fn new(behavior_type: BehaviorType, data: Vec<f32>, stream: Option<TransformStream>) -> Behavior {
         Behavior {
             behavior_type,
             data,
-            is_constant_behavior,
-            data_buffer,
+            stream,
         }
     }
 
     pub fn load_from_json(json: &serde_json::Value, registry: &ring_buffer::BufferRegistry) -> Behavior {
         let behavior_type: BehaviorType =
             BehaviorType::match_from_string(json["behaviorType"].as_str().unwrap());
-        let mut data_temp: Vec<_> = json["data"]
+        let data_temp: Vec<_> = json["data"]
             .as_array()
             .unwrap()
             .into_iter()
             .collect();
-        let mut data: Vec<f32> = vec![];
-        let data_buffer = if !BehaviorType::is_constant_behavior(behavior_type) {
-            let raw = data_temp.remove(0).to_string();
-            let name = raw[1..raw.len()-1].to_string();
-            if name.ends_with(".hdf5") {
-                let file = hdf5::File::open(&name).unwrap();
-                let dataset = file.dataset("states").unwrap();
-                let data_array: ndarray::Array2<f32> = dataset.read_2d().unwrap();
-                for row in data_array.rows() {
-                    data.extend(row.iter().copied());
-                }
-                None
-            } else {
-                let buf = registry.lock().unwrap()
-                    .entry(name)
-                    .or_insert_with(|| Arc::new(Mutex::new(ring_buffer::RingBuffer::new())))
-                    .clone();
-                Some(buf)
-            }
+
+        // A constant behavior's data is parameters; anything else names a frame source in slot 0
+        // and the stream owns the whole array from there.
+        if BehaviorType::is_constant_behavior(behavior_type) {
+            let data = data_temp.iter().map(|v| v.as_f64().unwrap() as f32).collect();
+            Behavior::new(behavior_type, data, None)
         } else {
-            None
-        };
-
-        for data_point in data_temp.iter() {
-            data.push(data_point.as_f64().unwrap() as f32);
+            let stream = TransformStream::from_json_data(&data_temp, registry);
+            Behavior::new(behavior_type, vec![], Some(stream))
         }
-
-        Behavior::new(behavior_type, data, data_buffer)
     }
 
     pub fn load_from_hdf5(data: &ArrayBase<OwnedRepr<[f32; 12]>, Dim<[usize; 1]>>) -> hdf5::Result<Behavior> {
@@ -131,13 +116,17 @@ impl Behavior {
             .flat_map(|arrs| arrs[a..b].iter().cloned())
             .collect();
 
-        Ok(Behavior::new(behavior_type, data_vec, None))
+        Ok(Behavior::new(behavior_type, vec![], Some(TransformStream::from_values(data_vec))))
+    }
+
+    /// Frames still in hand, for a behavior that has a finite source. `None` when there is no
+    /// stream at all, which is every constant behavior.
+    pub fn frames_remaining(&self) -> Option<usize> {
+        self.stream.as_ref().map(|s| s.remaining())
     }
 
     pub fn is_exhausted(&self) -> bool {
-        let buffer_empty = self.data_buffer.as_ref()
-            .map_or(true, |buf| buf.lock().unwrap().is_empty());
-        buffer_empty && self.data.len() < DATA_ARR_WIDTH
+        self.stream.as_ref().map_or(true, |s| s.is_exhausted())
     }
 }
 
@@ -308,7 +297,7 @@ impl Entity {
         let position = Point3::new(initial_transform[0], initial_transform[1], initial_transform[2]);
         println!("POSITION: {:?}", position);
 
-        let rotation_vec = Vector3::new(initial_transform[7], initial_transform[6], initial_transform[8]);
+        let rotation_vec = Vector3::new(initial_transform[6], initial_transform[7], initial_transform[8]);
         println!("ROTATION: {:?}", rotation_vec);
         let rotation = Quaternion::from_sv(
             (1.0 - rotation_vec.magnitude2()).max(0.0).sqrt(),
@@ -396,8 +385,11 @@ impl Entity {
 
     pub fn find_timesteps(&self) -> Option<usize> {
         if let Some(ref b) = self.behavior {
-            if !b.is_constant_behavior && !b.data.is_empty() {
-                return Some(b.data.len());
+            // A live stream reports zero — its total is unknowable, so it cannot size a
+            // progress bar and is skipped exactly as an empty `data` array used to be.
+            match b.frames_remaining() {
+                Some(n) if n > 0 => return Some(n),
+                _ => {}
             }
         }
         for child in &self.children {
@@ -458,35 +450,15 @@ impl Entity {
             }
 
             BehaviorType::ChangeTransform => {
-                let behavior = self.behavior.as_mut().unwrap();
-
-                let frame: Option<[f32; DATA_ARR_WIDTH]> = if let Some(ref buf) = behavior.data_buffer {
-                    let bytes = buf.lock().unwrap().read(DATA_ARR_WIDTH * F32_SIZE);
-                    if bytes.len() == DATA_ARR_WIDTH * F32_SIZE {
-                        let mut arr = [0f32; DATA_ARR_WIDTH];
-                        for i in 0..DATA_ARR_WIDTH {
-                            arr[i] = f32::from_be_bytes(bytes[i*F32_SIZE..(i+1)*F32_SIZE].try_into().unwrap());
-                        }
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                } else if behavior.data.len() >= DATA_ARR_WIDTH {
-                    let mut arr = [0f32; DATA_ARR_WIDTH];
-                    arr.copy_from_slice(&behavior.data[..DATA_ARR_WIDTH]);
-                    behavior.data.drain(0..DATA_ARR_WIDTH);
-                    Some(arr)
-                } else {
-                    None
-                };
+                let frame = self.behavior.as_mut()
+                    .and_then(|b| b.stream.as_mut())
+                    .and_then(|s| s.next_frame());
 
                 if let Some(data) = frame {
                     debug!("reading transform: x:{} y:{} z:{} v6:{} v7:{} v8:{}",
                         data[0], data[1], data[2], data[6], data[7], data[8]);
-                    let new_position = Point3::new(data[0], data[1], data[2]);
-                    let rot_vec = Vector3::new(data[6], data[7], data[8]);
-                    let w = (1.0 - rot_vec.magnitude2()).max(0.0).sqrt();
-                    self.rotation = Quaternion::from_sv(w, rot_vec);
+                    let (new_position, rotation) = transform_stream::frame_to_transform(&data);
+                    self.rotation = rotation;
                     self.set_position(new_position);
                 } else {
                     let p = *self.position.borrow();

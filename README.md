@@ -168,7 +168,8 @@ The scene JSON file defines the initial 3D environment and entities. Entities fo
       "h": 600.0,
       "camera": {
         "position": [2.7, -5.0, 0.0],
-        "rotation": [1.0, 0.0, 0.0, 0.0]
+        "rotation": [1.0, 0.0, 0.0, 0.0],
+        "stream": "camera_01.bin"  // Optional: drive this camera from a stream (see below)
       },
       "border color": [0.0, 0.0, 255.0],
       "alignment": "BottomRight"
@@ -295,6 +296,36 @@ After the initial file transfer completes, the server can stream indefinite live
 - Chunks stream continuously without a FILE_END marker
 - The same FILE_CHUNK format is used
 - Chunks are written into a per-stream ring buffer; out-of-order chunks are held in a reorder buffer keyed by offset and flushed in order
+
+### Stream-Driven Cameras
+
+A viewport camera can be driven by a stream instead of by the user, by naming a source in its
+`camera` block:
+
+```json
+"camera": {
+  "position": [0.0, -5.0, 5.0],
+  "rotation": [1.0, 0.0, 0.0, 0.0],
+  "stream": "chase_cam.bin"
+}
+```
+
+The frame layout is identical to a `ChangeTransform` behavior's — 12 f32, big-endian, with
+position in slots 0-2 and the quaternion's vector part in slots 6-8 — and the name is bound in the
+same registry, so no protocol or server change is needed to feed one. A name the server never
+sends fails the same silent way an entity's does: the camera simply never moves.
+
+Notes:
+- The mode is **locked**. `Enter` will not switch a stream-driven camera into or out of it, and
+  keyboard and mouse input are inert on it. Clicking it still takes focus, and says so.
+- `position` and `rotation` still apply until the first frame arrives.
+- A starved stream **holds the last pose** rather than resetting, matching how entities stall.
+- Camera streams do not count toward the run's completion, so a quiet camera will neither hold
+  the session open nor end it early.
+- Two viewports naming the *same* source each consume from one buffer and will halve each other's
+  frame rate. Give each its own name.
+- Only the first scene to arrive defines viewports, so in a multi-source run the declaration must
+  be in whichever scene wins that race — or, more simply, in all of them.
 
 ## Message Type Reference
 

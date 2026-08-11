@@ -616,10 +616,16 @@ impl<'a> State<'a> {
                     ) {
                         if self.scene.focus_viewport(hit) {
                             let mode = self.scene.viewports[hit].camera_controller.mode();
-                            let msg = self.viewport_toast(
-                                hit,
-                                format!("Now controlling ({})", mode.display_name()),
-                            );
+                            // A stream-driven viewport still takes focus, but saying "now
+                            // controlling" would be a lie. Refusing focus instead would be worse:
+                            // a click on a full-screen stream view would land on nothing at all
+                            // and look like the click was dropped.
+                            let msg = if mode.accepts_input() {
+                                format!("Now controlling ({})", mode.display_name())
+                            } else {
+                                "Camera is stream-driven".to_string()
+                            };
+                            let msg = self.viewport_toast(hit, msg);
                             self.scene.show_toast(msg);
                         }
                     }

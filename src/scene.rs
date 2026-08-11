@@ -8,7 +8,7 @@ use std::rc::Rc;
 use cgmath::{Matrix4, Vector3};
 use wgpu::{Device, Queue, BindGroupLayout, util::DeviceExt};
 
-use crate::{model, com, text, camera, behaviors_and_entities, ring_buffer};
+use crate::{model, com, text, camera, behaviors_and_entities, ring_buffer, transform_stream};
 use behaviors_and_entities::Entity;
 use model::DrawModel;
 
@@ -155,12 +155,13 @@ impl Viewport {
     }
 
     fn load_from_json(
-        json: &serde_json::Value, 
-        device: &Device, 
-        camera_bind_group_layout: &BindGroupLayout, 
-        ortho_matrix_bind_group_layout: &BindGroupLayout, 
+        json: &serde_json::Value,
+        device: &Device,
+        camera_bind_group_layout: &BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
+        registry: &ring_buffer::BufferRegistry,
     ) -> Self {
-        Viewport::new(
+        let mut viewport = Viewport::new(
             json["x"].as_f64().unwrap() as f32,
             json["y"].as_f64().unwrap() as f32,
             json["w"].as_f64().unwrap() as f32,
@@ -195,7 +196,20 @@ impl Viewport {
                 )
             },
             BorderAlignment::from_str(json["alignment"].as_str().unwrap()),
-        )
+        );
+
+        // A "stream" name puts this camera under wire control for the rest of the run. Absent,
+        // the camera keeps the position and rotation above and stays user-driven. The name is
+        // bound in the registry exactly like an entity's, so a mismatch with what the server
+        // sends fails the same silent way — the camera simply never moves.
+        if let Some(name) = json["camera"]["stream"].as_str() {
+            debug!("viewport camera is stream-driven from {name}");
+            viewport.camera_controller.attach_stream(
+                transform_stream::TransformStream::from_registry(name, registry)
+            );
+        }
+
+        viewport
     }
 
     pub fn resize_from_window(&mut self, screen_width: f32, screen_height: f32, queue: &Queue){
@@ -658,7 +672,7 @@ impl Scene {
         let mut viewport_vec = Vec::new();
         if let Some(viewport_temp) = json["viewports"].as_array() {
             for i in viewport_temp.iter() {
-                viewport_vec.push(Viewport::load_from_json(i, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout));
+                viewport_vec.push(Viewport::load_from_json(i, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout, &registry));
             }
         }
         if viewport_vec.is_empty() {
@@ -854,6 +868,11 @@ impl Scene {
         self.data_counter > self.total_timesteps
     }
 
+    /// Whether every entity stream has run dry — the network path's signal that a run is over.
+    ///
+    /// Deliberately ignores stream-driven cameras. A camera holding its last pose between packets
+    /// is a fine steady state, so counting it would let a quiet camera either hold the session
+    /// open past the end of the data or close it early while entities were still moving.
     pub fn all_streams_exhausted(&self) -> bool {
         self.entities.iter().all(|e| e.all_streams_exhausted())
     }
@@ -878,6 +897,13 @@ impl Scene {
         // keep the first viewport rather than building a fresh one: it already owns a valid camera
         // and bind groups
         self.viewports.truncate(1);
+        // Entities are dropped by the line above, so their buffer handles go with them. The
+        // surviving viewport's camera is the one thing that outlives the purge still holding an
+        // `Arc`, so a stream-driven camera has to be re-bound explicitly or it would stall
+        // forever against a buffer the registry no longer indexes. Must follow the purge.
+        if let Some(viewport) = self.viewports.first_mut() {
+            viewport.camera_controller.rebind_stream(registry);
+        }
         // the focused viewport may have just been dropped, and `focused_viewport` must stay a
         // valid index — every input path indexes with it unchecked
         self.focused_viewport = 0;

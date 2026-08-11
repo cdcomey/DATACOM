@@ -10,6 +10,8 @@ use std::collections::HashSet;
 use log::{info, debug};
 
 use crate::behaviors_and_entities::Entity;
+use crate::ring_buffer;
+use crate::transform_stream::{self, TransformStream};
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: Matrix4<f32> = Matrix4::new(
@@ -25,6 +27,9 @@ const APPROX_ZERO: f32 = 1e-8;
 pub enum CameraMode {
     FreeRoam,
     OrbitPoint,
+    /// Transform driven by a streamed `.bin`, exactly as an entity's `ChangeTransform` is.
+    /// Declared in scene JSON and locked — `switch_mode` will neither enter nor leave it.
+    Stream,
 }
 
 impl CameraMode {
@@ -33,7 +38,14 @@ impl CameraMode {
         match self {
             CameraMode::FreeRoam => "Free Roam",
             CameraMode::OrbitPoint => "Orbit Point",
+            CameraMode::Stream => "Stream",
         }
+    }
+
+    /// Whether the user can drive this camera. A stream-driven one takes its transform from the
+    /// wire, so keyboard and mouse have nothing to act on.
+    pub fn accepts_input(&self) -> bool {
+        !matches!(self, CameraMode::Stream)
     }
 }
 
@@ -123,6 +135,9 @@ pub struct CameraController {
     radius: Option<f32>,
     h_angle: Option<Rad<f32>>,
     v_angle: Option<Rad<f32>>,
+    /// Frame source for `CameraMode::Stream`, `None` in every other mode. Set once from scene
+    /// JSON via `attach_stream`; there is no path that adds or removes one at runtime.
+    stream: Option<TransformStream>,
 }
 
 impl CameraController {
@@ -146,6 +161,7 @@ impl CameraController {
             radius: None,
             h_angle: None,
             v_angle: None,
+            stream: None,
         }
     }
 
@@ -154,6 +170,24 @@ impl CameraController {
     pub fn mode(&self) -> CameraMode { self.mode }
 
     pub fn orbit_target(&self) -> Option<usize> { self.orbit_target }
+
+    /// Puts this camera under stream control, permanently.
+    ///
+    /// Attaching the source and entering the mode are one operation so the two cannot disagree —
+    /// a camera in `Stream` mode always has a stream, and a stream is never left unread in some
+    /// other mode. The scene loader is the only caller.
+    pub fn attach_stream(&mut self, stream: TransformStream) {
+        self.stream = Some(stream);
+        self.mode = CameraMode::Stream;
+    }
+
+    /// Re-binds a stream-driven camera to the registry after a purge. See
+    /// `TransformStream::rebind` for why the surviving viewport needs this and entities do not.
+    pub fn rebind_stream(&mut self, registry: &ring_buffer::BufferRegistry) {
+        if let Some(ref mut stream) = self.stream {
+            stream.rebind(registry);
+        }
+    }
 
     fn process_opposite_keys(pressed_keys: &HashSet<KeyCode>, key1: &KeyCode, key2: &KeyCode, key3: &KeyCode, key4: &KeyCode) -> f32 {
         (
@@ -221,14 +255,19 @@ impl CameraController {
             &KeyCode::KeyK,
         );
 
+        // Stream leaves both at zero. Nothing reads them in that mode — `update_camera_stream`
+        // takes the whole transform off the wire — but zeroing keeps the state honest rather
+        // than accumulating input that silently goes nowhere.
         self.l_translate_step = match self.mode {
             CameraMode::FreeRoam => w_s_up_down,
             CameraMode::OrbitPoint => space_shift,
+            CameraMode::Stream => 0.0,
         };
 
         self.v_translate_step = match self.mode {
             CameraMode::FreeRoam => space_shift,
             CameraMode::OrbitPoint => w_s_up_down,
+            CameraMode::Stream => 0.0,
         };
 
         state == ElementState::Pressed
@@ -310,6 +349,11 @@ impl CameraController {
                 // orbit_target is deliberately kept, so a round trip through free roam comes
                 // back to the same entity instead of snapping to the scene default.
             }
+            // Locked in both directions: a stream-driven camera's transform comes off the wire,
+            // so there is no free-roam or orbit state to switch into, and nothing would ever put
+            // it back. Matched here rather than guarded above so the compiler keeps the decision
+            // in view if a fourth mode is added.
+            CameraMode::Stream => {}
         }
     }
 
@@ -338,7 +382,28 @@ impl CameraController {
         match self.mode {
             CameraMode::FreeRoam => self.update_camera_freeroam(dt),
             CameraMode::OrbitPoint => self.update_camera_orbit(dt),
+            CameraMode::Stream => self.update_camera_stream(),
         }
+    }
+
+    /// Takes the camera's whole transform from the next streamed frame.
+    ///
+    /// Takes no `dt`: the stream defines its own pacing at one frame per render frame, exactly as
+    /// `ChangeTransform` does, so a slow render loop plays the motion slowly rather than skipping.
+    ///
+    /// A starved stream holds the last pose. That matches how entities stall, and it is the right
+    /// failure for a camera — freezing is readable, whereas snapping to an origin would look like
+    /// a crash every time a packet was late.
+    fn update_camera_stream(&mut self) {
+        let Some(frame) = self.stream.as_mut().and_then(|s| s.next_frame()) else {
+            debug!("camera stream starved, holding pose at {:?}", self.camera.position);
+            return;
+        };
+
+        let (position, rotation) = transform_stream::frame_to_transform(&frame);
+        debug!("camera stream: x:{} y:{} z:{}", position.x, position.y, position.z);
+        self.camera.position = position;
+        self.camera.rotation = rotation;
     }
 
     fn update_camera_freeroam(&mut self, dt: Duration) {
@@ -665,9 +730,90 @@ mod tests {
         assert_eq!(controller.orbit_target(), None);
     }
 
+    /// A controller already under stream control, fed from `frames`.
+    fn streamed_controller(frames: &[Vec<f32>]) -> CameraController {
+        let mut controller = test_controller();
+        let values: Vec<f32> = frames.iter().flatten().copied().collect();
+        controller.attach_stream(TransformStream::from_values(values));
+        controller
+    }
+
+    /// A frame placing the camera at `x` with no rotation.
+    fn frame_at(x: f32) -> Vec<f32> {
+        let mut frame = vec![0.0; crate::transform_stream::DATA_ARR_WIDTH];
+        frame[0] = x;
+        frame
+    }
+
+    #[test]
+    fn a_streamed_camera_takes_its_transform_from_the_frame() {
+        let mut controller = streamed_controller(&[frame_at(10.0), frame_at(20.0)]);
+        assert_eq!(controller.mode(), CameraMode::Stream, "attaching a stream enters the mode");
+
+        controller.update_camera(Duration::from_millis(16));
+        assert_eq!(controller.camera().position, Point3::new(10.0, 0.0, 0.0));
+
+        controller.update_camera(Duration::from_millis(16));
+        assert_eq!(controller.camera().position, Point3::new(20.0, 0.0, 0.0));
+    }
+
+    // Freezing is readable; snapping to an origin would look like a crash every late packet.
+    #[test]
+    fn a_starved_stream_holds_the_last_pose() {
+        let mut controller = streamed_controller(&[frame_at(10.0)]);
+        let dt = Duration::from_millis(16);
+
+        controller.update_camera(dt);
+        controller.update_camera(dt);
+        controller.update_camera(dt);
+
+        assert_eq!(controller.camera().position, Point3::new(10.0, 0.0, 0.0));
+    }
+
+    // The mode is declared in scene JSON and locked. Enter must not take a stream camera out of
+    // it, or the transform would freeze at whatever frame happened to be showing.
+    #[test]
+    fn stream_mode_cannot_be_switched_out_of() {
+        let scene = test_scene(&[("drone1", 0.0, true)]);
+        let mut controller = streamed_controller(&[frame_at(10.0)]);
+
+        controller.switch_mode(&scene);
+        assert_eq!(controller.mode(), CameraMode::Stream);
+
+        controller.process_keyboard(KeyCode::Enter, ElementState::Pressed, &scene);
+        assert_eq!(controller.mode(), CameraMode::Stream, "Enter is inert here");
+    }
+
+    // Keyboard input reaches a focused stream viewport but must not move it — the wire is the
+    // only authority on where this camera is.
+    #[test]
+    fn input_does_not_move_a_streamed_camera() {
+        let scene = test_scene(&[("drone1", 0.0, true)]);
+        let mut controller = streamed_controller(&[frame_at(10.0)]);
+        let dt = Duration::from_millis(16);
+
+        controller.update_camera(dt);
+        controller.process_keyboard(KeyCode::KeyW, ElementState::Pressed, &scene);
+        controller.process_mouse(50.0, 50.0);
+        controller.update_camera(dt);
+
+        assert_eq!(
+            controller.camera().position, Point3::new(10.0, 0.0, 0.0),
+            "held keys and mouse drags must not displace a stream-driven camera",
+        );
+    }
+
     #[test]
     fn camera_mode_display_names() {
         assert_eq!(CameraMode::FreeRoam.display_name(), "Free Roam");
         assert_eq!(CameraMode::OrbitPoint.display_name(), "Orbit Point");
+        assert_eq!(CameraMode::Stream.display_name(), "Stream");
+    }
+
+    #[test]
+    fn only_stream_mode_refuses_input() {
+        assert!(CameraMode::FreeRoam.accepts_input());
+        assert!(CameraMode::OrbitPoint.accepts_input());
+        assert!(!CameraMode::Stream.accepts_input());
     }
 }

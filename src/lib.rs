@@ -10,6 +10,7 @@ use std::fs::remove_file;
 
 mod behaviors_and_entities;
 mod ring_buffer;
+mod transform_stream;
 mod scene;
 mod state;
 mod model;

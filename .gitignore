@@ -7,6 +7,7 @@
 *.bin
 tmp.py
 /data/scene_loading/test_data
+/data/scene_loading/main_scene.json
 /data/object_loading/test_data
 /data/test_commands
 /output
