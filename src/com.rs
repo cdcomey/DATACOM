@@ -37,6 +37,8 @@ const CHUNK_LENGTH_BYTE_WIDTH: usize = 4;
 const CHUNK_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH + CHUNK_OFFSET_BYTE_WIDTH + CHUNK_LENGTH_BYTE_WIDTH;
 const FILE_END_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH;
 const RETRANSMIT_REQUEST_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH + CHUNK_OFFSET_BYTE_WIDTH;
+const COMMAND_ID_BYTE_WIDTH: usize = 2;
+const COMMAND_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + COMMAND_ID_BYTE_WIDTH;
 const CHECKSUM_WIDTH: usize = 4;
 
 const SECONDS_UNTIL_TIMEOUT: u64 = 30;
@@ -55,7 +57,10 @@ const ACK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const ASSEMBLY_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static FILE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+// Variant names mirror the wire-protocol constants in README.md's Message Type Reference rather
+// than Rust casing, so grepping either one finds the other.
 // TODO: only public for test file; change later
+#[allow(non_camel_case_types)]
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -65,6 +70,7 @@ pub enum MessageType {
     REQUEST_RETRANSMIT_CHUNK,
     TRANSMISSION_END,
     TRANSMISSION_ACK,
+    COMMAND,
     ERROR,
 }
 
@@ -77,6 +83,7 @@ impl MessageType {
             3 => MessageType::REQUEST_RETRANSMIT_CHUNK,
             4 => MessageType::TRANSMISSION_END,
             5 => MessageType::TRANSMISSION_ACK,
+            6 => MessageType::COMMAND,
             _ => MessageType::ERROR,
         }
     }
@@ -84,6 +91,34 @@ impl MessageType {
     // the sole encoder for the message type field — every frame we build goes through here so the
     // discriminants in this enum stay the single source of truth for the wire codes
     pub fn to_be_bytes(self) -> [u8; MESSAGE_TYPE_BYTE_WIDTH] {
+        (self as u16).to_be_bytes()
+    }
+}
+
+/// A global operation the scene-wide state, rather than one file's transfer, is subject to.
+///
+/// Carried in a `COMMAND` frame's payload rather than as its own `MessageType` so that adding one
+/// costs a value here instead of a top-level protocol code, and so a command that later needs
+/// arguments has somewhere to put them.
+#[allow(non_camel_case_types)]
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerCommand {
+    CLEAR_SCENE,
+    /// Any code this build does not recognise. Kept as a value rather than an error so a newer
+    /// server talking to an older client is ignored loudly instead of desynchronising the stream.
+    UNKNOWN,
+}
+
+impl ServerCommand {
+    fn get_from_bytes(value: u16) -> Self {
+        match value {
+            0 => ServerCommand::CLEAR_SCENE,
+            _ => ServerCommand::UNKNOWN,
+        }
+    }
+
+    pub fn to_be_bytes(self) -> [u8; COMMAND_ID_BYTE_WIDTH] {
         (self as u16).to_be_bytes()
     }
 }
@@ -232,6 +267,9 @@ pub enum AssemblyMessage {
     // a stream that had already joined has signalled the end of its data
     StreamFinished,
     SceneFileAssembled(String),
+    // a global command from the stream holding command authority; already gated, so a receiver
+    // that sees one may act on it without rechecking who sent it
+    Command(ServerCommand),
 }
 
 // What a single `receive_file` dispatch produced for the assembly thread to act on. One datagram
@@ -246,6 +284,8 @@ pub enum ReceiveOutcome {
     SceneFile { name: String, data: Vec<u8> },
     // the server signalled TRANSMISSION_END and has been ACKed
     TransmissionComplete,
+    // a decoded command frame, not yet checked against this stream's authority
+    Command(ServerCommand),
 }
 
 // A server declares itself the command authority with a top-level `"authority": true` in its scene
@@ -280,6 +320,20 @@ pub fn create_assembly_thread(
         loop {
             match receive_file(&rx, &tx_sender, &mut active_files, &mut buf, &registry) {
                 ReceiveOutcome::Nothing => {}
+
+                // Gated here rather than on the main thread because authority is per-stream: this
+                // thread is the only one that knows whether the socket the command arrived on is
+                // the one holding it. Everything forwarded past this point is already authorised.
+                ReceiveOutcome::Command(command) => {
+                    if !has_authority {
+                        warn!("ignoring {:?} from a stream that does not hold command authority", command);
+                    } else if command == ServerCommand::UNKNOWN {
+                        warn!("ignoring an unrecognised command from the authority stream");
+                    } else {
+                        info!("forwarding {:?} from the authority stream", command);
+                        let _ = tx_main.send(AssemblyMessage::Command(command));
+                    }
+                }
 
                 ReceiveOutcome::SceneFile { name, data } => {
                     debug!("A: assembled scene file {}", name);
@@ -519,6 +573,32 @@ fn finish_receiving_transmission(buf: &mut Vec<u8>){
     buf.drain(0..MESSAGE_TYPE_BYTE_WIDTH);
 }
 
+/// Reads the command id that follows a `COMMAND` message type.
+///
+/// Returns `None` only when the rest of the frame has not arrived yet, leaving `buf` untouched so
+/// the next call resumes where this one stopped. A command frame is four bytes and arrives in one
+/// datagram, so that is a formality rather than a path worth expecting.
+fn receive_command(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant) -> Option<ServerCommand> {
+    while buf.len() < COMMAND_BYTE_WIDTH && !has_timed_out(start_time) {
+        let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
+            return None
+        };
+
+        buf.extend_from_slice(&msg);
+    }
+
+    if buf.len() < COMMAND_BYTE_WIDTH {
+        return None;
+    }
+
+    let id_bytes: [u8; COMMAND_ID_BYTE_WIDTH] = buf[MESSAGE_TYPE_BYTE_WIDTH..COMMAND_BYTE_WIDTH]
+        .try_into()
+        .unwrap();
+    buf.drain(0..COMMAND_BYTE_WIDTH);
+
+    Some(ServerCommand::get_from_bytes(u16::from_be_bytes(id_bytes)))
+}
+
 fn json_pretty(value: &serde_json::Value, depth: usize) -> String {
     let pad = "  ".repeat(depth);
     let inner_pad = "  ".repeat(depth + 1);
@@ -671,6 +751,13 @@ pub fn receive_file(
             debug!("L: received REQUEST_RETRANSMIT_CHUNK (unexpected on client)");
             drain_frame(buf, RETRANSMIT_REQUEST_BYTE_WIDTH);
             ReceiveOutcome::Nothing
+        },
+        MessageType::COMMAND => {
+            debug!("L: received COMMAND");
+            match receive_command(&rx_main, buf, start_time) {
+                Some(command) => ReceiveOutcome::Command(command),
+                None => ReceiveOutcome::Nothing,
+            }
         },
         MessageType::TRANSMISSION_END => {
             debug!("L: received TRANSMISSION_END");
@@ -873,6 +960,52 @@ mod tests {
         assert!(scene_declares_authority(scene.as_bytes()));
     }
 
+    #[test]
+    fn a_command_frame_is_decoded_and_drained() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
+        frame.extend_from_slice(&ServerCommand::CLEAR_SCENE.to_be_bytes());
+        assert_eq!(frame.len(), COMMAND_BYTE_WIDTH);
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Command(ServerCommand::CLEAR_SCENE)));
+        assert!(buf.is_empty(), "the command frame must not be re-dispatched");
+    }
+
+    // A newer server's command reaching an older client. It has to decode to something and come off
+    // the buffer, or the assembly thread spins on it the way an undrained ERROR frame would.
+    #[test]
+    fn an_unrecognised_command_id_is_drained() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
+        frame.extend_from_slice(&999u16.to_be_bytes());
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Command(ServerCommand::UNKNOWN)));
+        assert!(buf.is_empty());
+    }
+
+    // The one case that must *not* drain: half a frame is resumable, and dropping those two bytes
+    // would leave the command id at offset 0 to be misread as a message type.
+    #[test]
+    fn a_partial_command_frame_is_left_for_the_next_call() {
+        let frame = MessageType::COMMAND.to_be_bytes().to_vec();
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Nothing));
+        assert_eq!(buf.len(), MESSAGE_TYPE_BYTE_WIDTH, "the type field waits for its payload");
+    }
+
+    #[test]
+    fn server_command_codes_match_the_wire_protocol() {
+        assert_eq!(ServerCommand::CLEAR_SCENE.to_be_bytes(), 0u16.to_be_bytes());
+        assert_eq!(ServerCommand::get_from_bytes(0), ServerCommand::CLEAR_SCENE);
+        assert_eq!(ServerCommand::get_from_bytes(1), ServerCommand::UNKNOWN);
+    }
+
     // The wire codes are the protocol contract in README.md; the enum discriminants now encode
     // them, so a variant inserted in the middle would silently renumber every later message.
     #[test]
@@ -884,6 +1017,7 @@ mod tests {
             (MessageType::REQUEST_RETRANSMIT_CHUNK, 3),
             (MessageType::TRANSMISSION_END, 4),
             (MessageType::TRANSMISSION_ACK, 5),
+            (MessageType::COMMAND, 6),
         ] {
             assert_eq!(msg_type.to_be_bytes(), code.to_be_bytes(), "{:?} encodes to the wrong code", msg_type);
             assert_eq!(MessageType::get_from_bytes(code), msg_type, "code {} decodes to the wrong variant", code);

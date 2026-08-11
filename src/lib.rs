@@ -267,6 +267,17 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                 com::AssemblyMessage::StreamReady => ready_streams += 1,
                 com::AssemblyMessage::SceneFileAssembled(json) => extra_scene_jsons.push(json),
                 com::AssemblyMessage::StreamFinished => {}
+                // This phase exists to assemble the scene and object files the renderer is built
+                // from; there is no scene to act on yet. Warned rather than dropped silently: the
+                // symptom of ignoring one is that pre-command scene data stays on screen, which
+                // looks exactly like a command that ran and did nothing.
+                com::AssemblyMessage::Command(command) => {
+                    log::warn!(
+                        "ignoring {:?}: commands are only accepted once a stream is live, not \
+                         during the initial file transfer",
+                        command,
+                    );
+                }
             }
         }
 
@@ -394,6 +405,17 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                         // the scene that is already being rendered
                         let added = state.scene.append_entities_from_json_str(&json, &registry);
                         info!("merged {} entities from a mid-session stream", added);
+                    }
+                    com::AssemblyMessage::Command(com::ServerCommand::CLEAR_SCENE) => {
+                        // Reported rather than done quietly: a stream that joined moments before
+                        // this lands is wiped by it, and the count is the only trace of that. The
+                        // server is not told, so the log is where a vanished drone shows up.
+                        let removed = state.scene.entities.len();
+                        state.scene.clear(&registry);
+                        info!("cleared the scene ({} entities removed)", removed);
+                    }
+                    com::AssemblyMessage::Command(command) => {
+                        log::warn!("no handler for {:?}", command);
                     }
                 }
             }

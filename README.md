@@ -142,6 +142,22 @@ Signals completion of the initial file transfer phase:
 
 Upon receiving `TRANSMISSION_END`, the client replies with a `TRANSMISSION_ACK` (`0x00 0x05`) so the server knows the client has all initial files.
 
+#### Command Frame
+
+Carries a global command rather than file data. Only honoured from the stream holding command
+authority — see [Command Authority](#command-authority):
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Message Type | 2 bytes | `0x00 0x06` (COMMAND) |
+| Command | 2 bytes | See the Command Reference below |
+
+The command id is a separate field rather than its own message type so that adding a command costs
+a value in that table instead of a top-level protocol code, and so a command that later takes
+arguments has somewhere to put them. A command id this client does not recognise is logged and
+ignored; the frame is a fixed four bytes either way, so an unknown one cannot desynchronise the
+stream.
+
 ### Scene Definition Format
 
 The scene JSON file defines the initial 3D environment and entities. Entities form a **hierarchical scene graph**: each entity has a `Children` array whose members are themselves entities (with their own transforms, meshes, behaviors, and children). Rotations are quaternions in `[w, x, y, z]` order. Example structure:
@@ -283,6 +299,19 @@ Authority and base-scene ownership are independent. The first scene to finish as
 defines viewports and terrain regardless of who holds authority, so a late-arriving operator takes
 command authority without redefining the environment.
 
+Commands are only acted on once streaming is under way. During the initial file transfer the client
+is still assembling the scene and object files the renderer is built from, so there is nothing for a
+command to act on and any that arrives is logged and dropped. Precisely, that phase ends when the
+*first* stream signals `TRANSMISSION_END` — not when the window opens — so a command sent during the
+window and renderer setup that follows is honoured normally. A server should send commands only
+after its own `TRANSMISSION_ACK`, which is comfortably inside the live phase.
+
+A clear takes effect when the client processes it, not when the server sent it. A stream whose scene
+finishes assembling in the same moment may land on either side of it; one that lands just before is
+merged and then wiped. The server is not told, and a scene is sent only once per stream, so the
+count in the client's `cleared the scene (N entities removed)` log line is the only record that it
+happened.
+
 Note that this is a coordination mechanism, not a security one: the wire protocol is unauthenticated,
 so authority prevents conflicting or accidental global commands, not hostile ones.
 
@@ -337,6 +366,13 @@ Notes:
 | REQUEST_RETRANSMIT_CHUNK | `0x00 0x03` | Request a failed chunk be resent |
 | TRANSMISSION_END | `0x00 0x04` | Initial transfer phase complete |
 | TRANSMISSION_ACK | `0x00 0x05` | Client acknowledges TRANSMISSION_END |
+| COMMAND | `0x00 0x06` | A global command; see Command Frame |
+
+### Command Reference
+
+| Command | Code | Description |
+|---------|------|-------------|
+| CLEAR_SCENE | `0x00 0x00` | Remove every entity and the buffers feeding them |
 
 ## Architecture
 ```

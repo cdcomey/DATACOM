@@ -938,36 +938,35 @@ impl Scene {
         self.entities.iter().all(|e| e.all_streams_exhausted())
     }
 
-    /// Resets the scene to a single camera and no entities.
+    /// Removes every entity and the buffers feeding them, leaving the view as it was.
     ///
     /// Takes the registry so the entity drop and the buffer purge happen together: they are one
     /// operation, and splitting them lets a replacement scene bind a name whose buffer is about to
     /// be dropped. See `ring_buffer::clear_registry` for why dropping entities alone is not enough.
     ///
     /// Deliberately left intact:
-    /// - `terrain` and any viewport beyond the first are environment the *first* scene defined.
-    ///   `base_scene_written` is one-way, so nothing can ever re-establish them — wiping terrain
-    ///   would be unrecoverable for the rest of the run.
+    /// - `viewports` and `terrain`. `base_scene_written` is one-way, so nothing can re-establish
+    ///   either — dropping a viewport would cost a stream camera that no later scene could
+    ///   restore, and a session is expected to hold the viewport count it started with.
     /// - `text_boxes` is HUD chrome, not scene content; `state.rs` indexes `text_boxes[0]` for the
     ///   framerate readout and would panic if it were emptied.
     /// - the frame and timestep counters, so a clear does not look like a restart to anything
     ///   reading data by index.
+    ///
+    /// Cameras keep whatever they were pointed at. An orbiting one holds its focus point through
+    /// an `Rc` shared with the entity, so the point survives the entity being dropped and the
+    /// camera stays put rather than snapping or panicking.
     pub fn clear(&mut self, registry: &ring_buffer::BufferRegistry) {
         self.entities.clear();
         ring_buffer::clear_registry(registry);
-        // keep the first viewport rather than building a fresh one: it already owns a valid camera
-        // and bind groups
-        self.viewports.truncate(1);
-        // Entities are dropped by the line above, so their buffer handles go with them. The
-        // surviving viewport's camera is the one thing that outlives the purge still holding an
-        // `Arc`, so a stream-driven camera has to be re-bound explicitly or it would stall
-        // forever against a buffer the registry no longer indexes. Must follow the purge.
-        if let Some(viewport) = self.viewports.first_mut() {
+        // Entities are dropped above, so their buffer handles go with them. Cameras are not: every
+        // stream-driven one outlives the purge still holding an `Arc`, and `com::write_to_registry`
+        // looks entries up with `get`, so a camera left unbound would stall forever against a
+        // buffer the registry no longer indexes. Must follow the purge, and must cover every
+        // viewport rather than one — a stalled camera reports nothing.
+        for viewport in &mut self.viewports {
             viewport.camera_controller.rebind_stream(registry);
         }
-        // the focused viewport may have just been dropped, and `focused_viewport` must stay a
-        // valid index — every input path indexes with it unchecked
-        self.focused_viewport = 0;
     }
 
     // returns how many entities were merged in, so callers can report whether a stream that
