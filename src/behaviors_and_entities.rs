@@ -2,9 +2,10 @@
 use cgmath::{Point3, Vector3, Quaternion, Matrix4};
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 use std::fs::OpenOptions;
-use log::{debug, info, error};
+use log::{debug, info, warn, error};
 use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
 use ndarray::{ArrayBase, OwnedRepr, Dim};
 
@@ -135,8 +136,82 @@ impl Behavior {
 }
 
 #[allow(dead_code)]
+/// Separates the segments of an entity path: `namespace/root/child`.
+///
+/// A name containing one would make every path it appears in ambiguous, so `normalize_name`
+/// substitutes it rather than let a command resolve to an entity nobody meant.
+pub const PATH_SEPARATOR: char = '/';
+
+/// Marks a segment the client had to make unique: `propeller#0`, `propeller#1`.
+///
+/// Every collision this scheme resolves — duplicate siblings, duplicate namespaces, entities with
+/// no name at all — is resolved the same way, so an operator who learns the convention from one
+/// warning can read all of them.
+pub const DISAMBIGUATOR: char = '#';
+
+/// Turns one JSON `Name` into a usable path segment.
+///
+/// `index` is the entity's position in the array that declared it, which is what an entity with no
+/// name is addressed by. That index is the *declaring server's own* ordering, so a server can
+/// predict it; the entity's eventual index in the merged scene cannot be predicted by anyone,
+/// since it depends on which stream wins the arrival race.
+fn normalize_name(raw: &str, index: usize) -> String {
+    if raw.is_empty() {
+        return format!("{}{}", DISAMBIGUATOR, index);
+    }
+
+    if raw.contains(PATH_SEPARATOR) {
+        let substituted = raw.replace(PATH_SEPARATOR, "_");
+        warn!(
+            "entity name {:?} contains '{}', which separates path segments; it is addressable as \
+             {:?} instead",
+            raw, PATH_SEPARATOR, substituted,
+        );
+        return substituted;
+    }
+
+    raw.to_string()
+}
+
+/// Renames colliding entities in one sibling set until every name in it is distinct.
+///
+/// Every member of a colliding group is suffixed, including the first. Leaving one holding the
+/// bare name would let a command that names it resolve to an arbitrary member of the group — and a
+/// command that silently hits the wrong drone is worse than one that visibly hits nothing, which
+/// is the whole reason this scheme exists.
+pub fn disambiguate_names(entities: &mut [Entity], context: &str) {
+    let mut totals: HashMap<String, usize> = HashMap::new();
+    for entity in entities.iter() {
+        *totals.entry(entity.name.clone()).or_insert(0) += 1;
+    }
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for entity in entities.iter_mut() {
+        let total = totals[&entity.name];
+        if total < 2 {
+            continue;
+        }
+
+        let occurrence = *seen.entry(entity.name.clone()).or_insert(0);
+        if occurrence == 0 {
+            warn!(
+                "{} declares {} entities named {:?}; they are addressable as {}{}0 through {}{}{}",
+                context, total, entity.name,
+                entity.name, DISAMBIGUATOR,
+                entity.name, DISAMBIGUATOR, total - 1,
+            );
+        }
+        *seen.get_mut(&entity.name).unwrap() += 1;
+        entity.name = format!("{}{}{}", entity.name, DISAMBIGUATOR, occurrence);
+    }
+}
+
 pub struct Entity {
     name: String,
+    /// The namespace this entity's subtree is addressed under, set on roots only. A child's
+    /// qualification comes from the ancestor chain a path walks through, not from a field of its
+    /// own, so there is one place per subtree that can disagree with the scene that declared it.
+    namespace: Option<String>,
     position: Rc<RefCell<Point3<f32>>>,
     rotation: Quaternion<f32>,
     scale: Vector3<f32>,
@@ -188,6 +263,7 @@ impl Entity {
         };
         Entity {
             name,
+            namespace: None,
             position: Rc::new(RefCell::new(position)),
             rotation,
             scale,
@@ -209,6 +285,7 @@ impl Entity {
     ) -> Self {
         Entity {
             name,
+            namespace: None,
             position: Rc::new(RefCell::new(position)),
             rotation,
             scale: Vector3::new(1.0, 1.0, 1.0),
@@ -237,10 +314,20 @@ impl Entity {
         )
     }
 
-    pub fn load_from_json(json: &serde_json::Value, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout, registry: &ring_buffer::BufferRegistry) -> Entity {
+    /// Hangs `children` off a test entity, for the path tests — `new_root` is the only constructor
+    /// that takes children and it needs a GPU.
+    #[cfg(test)]
+    pub fn with_children(mut self, children: Vec<Entity>) -> Entity {
+        self.children = children;
+        self
+    }
+
+    /// `index` is this entity's position in the `entities` or `Children` array that declared it,
+    /// used to address it if it has no name of its own.
+    pub fn load_from_json(json: &serde_json::Value, index: usize, device: &wgpu::Device, model_bind_group_layout: &wgpu::BindGroupLayout, registry: &ring_buffer::BufferRegistry) -> Entity {
         // as_str, not to_string: Value::to_string on a JSON string keeps the quotes, and this
         // name is displayed. The child branch below has always done it this way.
-        let name = json["Name"].as_str().unwrap_or("").to_string();
+        let name = normalize_name(json["Name"].as_str().unwrap_or(""), index);
         debug!("loading entity {name}");
 
         let position_arr: Vec<f32> = json["Position"].as_array().unwrap()
@@ -258,9 +345,9 @@ impl Entity {
         let entity_behavior = json["Behavior"].as_object()
             .map(|_| Behavior::load_from_json(&json["Behavior"], registry));
 
-        let children: Vec<Entity> = match json["Children"].as_array() {
-            Some(array) => array.iter().map(|c| {
-                let child_name = c["Name"].as_str().unwrap_or("").to_string();
+        let mut children: Vec<Entity> = match json["Children"].as_array() {
+            Some(array) => array.iter().enumerate().map(|(child_index, c)| {
+                let child_name = normalize_name(c["Name"].as_str().unwrap_or(""), child_index);
 
                 let child_pos_arr: Vec<f32> = c["Position"].as_array().unwrap()
                     .iter().map(|v| v.as_f64().unwrap() as f32).collect();
@@ -289,6 +376,11 @@ impl Entity {
             }).collect(),
             None => vec![],
         };
+
+        // Scoped to one parent, because that is the scope a child path segment is resolved in:
+        // every drone in a fleet having a `propeller RRT` is fine, two of them under *one* drone
+        // is not. Recursion is implicit — each nested load has already settled its own children.
+        disambiguate_names(&mut children, &format!("entity {:?}", name));
 
         Entity::new_root(name, position, rotation, scale, entity_behavior, children, device, model_bind_group_layout)
     }
@@ -333,6 +425,57 @@ impl Entity {
     }
 
     pub fn name(&self) -> &str { &self.name }
+
+    /// Places this entity's subtree in `namespace`. The scene loaders are the only callers, and
+    /// they call it on roots only — see the field.
+    pub fn set_namespace(&mut self, namespace: String) {
+        self.namespace = Some(namespace);
+    }
+
+    /// This entity's path as a root: its name, qualified by its namespace when it has a non-empty
+    /// one. A single-source run declares nothing and addresses entities by bare name, exactly as
+    /// it did before namespaces existed.
+    pub fn qualified_name(&self) -> String {
+        match &self.namespace {
+            Some(namespace) if !namespace.is_empty() => {
+                format!("{}{}{}", namespace, PATH_SEPARATOR, self.name)
+            }
+            _ => self.name.clone(),
+        }
+    }
+
+    /// Resolves a path relative to this entity — `propeller RRT`, or `arm/propeller RRT` deeper in.
+    ///
+    /// Sibling names are unique after loading, so the first match at each level is the only match.
+    pub fn find_descendant_mut(&mut self, path: &str) -> Option<&mut Entity> {
+        let (segment, rest) = match path.split_once(PATH_SEPARATOR) {
+            Some((head, tail)) => (head, Some(tail)),
+            None => (path, None),
+        };
+
+        let child = self.children.iter_mut().find(|c| c.name == segment)?;
+        match rest {
+            Some(tail) => child.find_descendant_mut(tail),
+            None => Some(child),
+        }
+    }
+
+    /// Appends this entity's full path and every descendant's, depth first.
+    ///
+    /// `prefix` is the path of the parent, or empty for a root — which is the only case that
+    /// consults the namespace, since a child inherits its qualification through `prefix`.
+    pub fn collect_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        let path = if prefix.is_empty() {
+            self.qualified_name()
+        } else {
+            format!("{}{}{}", prefix, PATH_SEPARATOR, self.name)
+        };
+
+        out.push(path.clone());
+        for child in &self.children {
+            child.collect_paths(&path, out);
+        }
+    }
 
     pub fn get_position(&self) -> Rc<RefCell<Point3<f32>>> { Rc::clone(&self.position) }
 
@@ -495,5 +638,124 @@ impl Entity {
     pub fn all_streams_exhausted(&self) -> bool {
         let own = self.behavior.as_ref().map_or(true, |b| b.is_exhausted());
         own && self.children.iter().all(|c| c.all_streams_exhausted())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgmath::EuclideanSpace;
+
+    fn entity(name: &str) -> Entity {
+        Entity::for_test(name, Point3::origin(), None)
+    }
+
+    fn names(entities: &[Entity]) -> Vec<&str> {
+        entities.iter().map(|e| e.name()).collect()
+    }
+
+    // An entity nobody named still has to be addressable, and the index used is the one the
+    // declaring server can predict: its position in that server's own array.
+    #[test]
+    fn an_unnamed_entity_is_addressed_by_its_declaration_index() {
+        assert_eq!(normalize_name("", 0), "#0");
+        assert_eq!(normalize_name("", 3), "#3");
+        assert_eq!(normalize_name("Drone_01", 3), "Drone_01", "a real name ignores the index");
+    }
+
+    // A separator inside a segment would make the path it sits in parse into different segments
+    // than the author meant, and resolve to an entity nobody named.
+    #[test]
+    fn a_name_containing_the_separator_is_substituted() {
+        assert_eq!(normalize_name("wing/left", 0), "wing_left");
+        assert_eq!(normalize_name("a/b/c", 0), "a_b_c");
+    }
+
+    // The first duplicate is suffixed too. Leaving it holding the bare name would let a command
+    // naming it hit one arbitrary member of the group, which is worse than hitting nothing.
+    #[test]
+    fn every_colliding_sibling_is_suffixed_including_the_first() {
+        let mut siblings = vec![entity("propeller"), entity("tail"), entity("propeller")];
+
+        disambiguate_names(&mut siblings, "a test");
+
+        assert_eq!(names(&siblings), vec!["propeller#0", "tail", "propeller#1"]);
+    }
+
+    #[test]
+    fn a_unique_sibling_set_is_left_alone() {
+        let mut siblings = vec![entity("body"), entity("tail")];
+
+        disambiguate_names(&mut siblings, "a test");
+
+        assert_eq!(names(&siblings), vec!["body", "tail"]);
+    }
+
+    // Suffixes follow declaration order, so the same scene always produces the same addresses —
+    // a server has to be able to predict what its own entities are called.
+    #[test]
+    fn disambiguation_follows_declaration_order() {
+        let mut siblings = vec![entity("a"), entity("a"), entity("a")];
+
+        disambiguate_names(&mut siblings, "a test");
+
+        assert_eq!(names(&siblings), vec!["a#0", "a#1", "a#2"]);
+    }
+
+    #[test]
+    fn paths_are_qualified_by_namespace_and_hierarchy() {
+        let mut root = entity("Drone_01").with_children(vec![
+            entity("body"),
+            entity("propeller").with_children(vec![entity("blade")]),
+        ]);
+        root.set_namespace("fleet_a".to_string());
+
+        let mut paths = Vec::new();
+        root.collect_paths("", &mut paths);
+
+        assert_eq!(paths, vec![
+            "fleet_a/Drone_01",
+            "fleet_a/Drone_01/body",
+            "fleet_a/Drone_01/propeller",
+            "fleet_a/Drone_01/propeller/blade",
+        ]);
+    }
+
+    // The single-source case: nothing declared, so nothing is prepended and the paths are what
+    // someone reading the scene file would already have guessed.
+    #[test]
+    fn an_undeclared_namespace_adds_no_segment() {
+        let mut root = entity("Drone_01").with_children(vec![entity("body")]);
+        root.set_namespace(String::new());
+
+        let mut paths = Vec::new();
+        root.collect_paths("", &mut paths);
+
+        assert_eq!(paths, vec!["Drone_01", "Drone_01/body"]);
+    }
+
+    #[test]
+    fn a_descendant_resolves_at_any_depth() {
+        let mut root = entity("Drone_01").with_children(vec![
+            entity("body"),
+            entity("arm").with_children(vec![entity("propeller RRT")]),
+        ]);
+
+        assert_eq!(root.find_descendant_mut("body").map(|e| e.name().to_string()), Some("body".to_string()));
+        assert_eq!(
+            root.find_descendant_mut("arm/propeller RRT").map(|e| e.name().to_string()),
+            Some("propeller RRT".to_string()),
+        );
+    }
+
+    // A miss has to stay a miss. Resolving a wrong-but-plausible entity is the failure this whole
+    // scheme is built to prevent.
+    #[test]
+    fn a_path_that_names_nothing_resolves_to_nothing() {
+        let mut root = entity("Drone_01").with_children(vec![entity("body")]);
+
+        assert!(root.find_descendant_mut("wing").is_none());
+        assert!(root.find_descendant_mut("body/bolt").is_none(), "a leaf has no children to search");
+        assert!(root.find_descendant_mut("").is_none());
     }
 }

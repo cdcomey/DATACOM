@@ -1,6 +1,6 @@
 
 use text::{TextDisplay};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::process::{Command, Stdio};
 use std::io::Write;
 use std::sync::Arc;
@@ -8,8 +8,10 @@ use std::rc::Rc;
 use cgmath::{Matrix4, Vector3};
 use wgpu::{Device, Queue, BindGroupLayout, util::DeviceExt};
 
+use std::collections::HashSet;
+
 use crate::{model, com, text, camera, behaviors_and_entities, ring_buffer, transform_stream};
-use behaviors_and_entities::Entity;
+use behaviors_and_entities::{Entity, DISAMBIGUATOR, PATH_SEPARATOR};
 use model::DrawModel;
 
 const BYTES_PER_PIXEL: u32 = 4;
@@ -317,9 +319,72 @@ impl Viewport {
 }
 
 // Define the scene structure
+/// Reserves the namespace a scene declares, returning the one its entities are addressed under.
+///
+/// Mirrors the authority claim: declared rather than derived, first declarer wins, and a second
+/// claim is a misconfiguration worth surfacing rather than a tie to break. What happens to the
+/// loser differs — authority is simply withheld, but a scene's entities have to stay addressable,
+/// so a duplicate claim yields `fleet_a#1` rather than nothing.
+///
+/// A scene that declares nothing claims the empty namespace and is addressed by bare entity name,
+/// so single-source runs and every scene written before this existed are unaffected. A *second*
+/// undeclared scene cannot also do that without its roots colliding with the first's, so it is
+/// given a synthesized namespace and told to declare one.
+///
+/// Deriving the namespace from the connection instead would be free of declarations, but the
+/// network layer cannot supply one: the assembly thread never learns its own address, and the base
+/// scene reaches the renderer through a file on disk rather than through a message. Riding along
+/// in the scene JSON is what survives both paths.
+fn claim_namespace(claimed: &mut HashSet<String>, json: &serde_json::Value, context: &str) -> String {
+    let declared = json["namespace"].as_str().unwrap_or("");
+    let declared = if declared.contains(PATH_SEPARATOR) {
+        let substituted = declared.replace(PATH_SEPARATOR, "_");
+        warn!(
+            "namespace {:?} contains '{}', which separates path segments; {} is addressed under \
+             {:?} instead",
+            declared, PATH_SEPARATOR, context, substituted,
+        );
+        substituted
+    } else {
+        declared.to_string()
+    };
+
+    if claimed.insert(declared.clone()) {
+        return declared;
+    }
+
+    let mut suffix = 1;
+    let granted = loop {
+        let candidate = format!("{}{}{}", declared, DISAMBIGUATOR, suffix);
+        if claimed.insert(candidate.clone()) {
+            break candidate;
+        }
+        suffix += 1;
+    };
+
+    if declared.is_empty() {
+        warn!(
+            "{} declares no namespace, and entities are already addressed by bare name; its own \
+             are addressed under {:?} instead — set a top-level \"namespace\" to choose one",
+            context, granted,
+        );
+    } else {
+        warn!(
+            "{} claims namespace {:?}, which another stream already holds; its entities are \
+             addressed under {:?} instead",
+            context, declared, granted,
+        );
+    }
+
+    granted
+}
+
 pub struct Scene {
     pub axes: model::Axes,
     pub entities: Vec<Entity>,
+    /// Namespaces already spoken for, so a second stream claiming one is caught rather than
+    /// silently sharing addresses with the first. See `claim_namespace`.
+    claimed_namespaces: HashSet<String>,
     pub terrain: model::Terrain,
     pub text_boxes: Vec<text::TextDisplay>,
     text_resources: text::TextResources,
@@ -491,6 +556,10 @@ impl Scene {
         Scene {
             axes,
             entities,
+            // Filled in by the JSON loader after construction rather than threaded through this
+            // constructor's fourteen parameters. The HDF5 path claims nothing: it has no scene
+            // JSON to declare a namespace in, and no server that could address its entities.
+            claimed_namespaces: HashSet::new(),
             terrain,
             text_boxes,
             text_resources,
@@ -835,12 +904,21 @@ impl Scene {
             .unwrap()
             .into_iter()
             .collect();
-        let mut entity_vec = vec![];
-        for i in entity_temp.iter() {
-            entity_vec.push(Entity::load_from_json(*i, &device, &model_bind_group_layout, &registry));
-        }
 
-        let scene = Scene::new(
+        let mut claimed_namespaces = HashSet::new();
+        let namespace = claim_namespace(&mut claimed_namespaces, &json, "the base scene");
+
+        let mut entity_vec = vec![];
+        for (index, i) in entity_temp.iter().enumerate() {
+            let mut entity = Entity::load_from_json(*i, index, &device, &model_bind_group_layout, &registry);
+            entity.set_namespace(namespace.clone());
+            entity_vec.push(entity);
+        }
+        // Roots only need to be distinct within their own namespace, and every later scene gets a
+        // namespace of its own, so one pass over this scene's roots settles them for the run.
+        behaviors_and_entities::disambiguate_names(&mut entity_vec, "the base scene");
+
+        let mut scene = Scene::new(
             entity_vec,
             total_timesteps,
             None,
@@ -857,7 +935,9 @@ impl Scene {
             screen_height,
         );
 
+        scene.claimed_namespaces = claimed_namespaces;
         scene.warn_on_shared_stream_sources();
+        scene.log_addressable_paths();
         scene
     }
 
@@ -1090,6 +1170,10 @@ impl Scene {
     /// camera stays put rather than snapping or panicking.
     pub fn clear(&mut self, registry: &ring_buffer::BufferRegistry) {
         self.entities.clear();
+        // Released with the entities they addressed. A namespace is only a claim on names, and
+        // there are no names left to collide with — so a fleet that reconnects after a clear gets
+        // `fleet_a` back rather than being pushed to `fleet_a#1` by its own earlier self.
+        self.claimed_namespaces.clear();
         ring_buffer::clear_registry(registry);
         // Entities are dropped above, so their buffer handles go with them. Cameras are not: every
         // stream-driven one outlives the purge still holding an `Arc`, and `com::write_to_registry`
@@ -1125,15 +1209,65 @@ impl Scene {
         }
 
         let Some(entity_array) = json["entities"].as_array() else { return 0 };
-        for e in entity_array {
-            self.entities.push(Entity::load_from_json(e, &self.device, &self.model_bind_group_layout, registry));
+
+        let namespace = claim_namespace(&mut self.claimed_namespaces, &json, "a merged scene");
+        let first_merged = self.entities.len();
+        for (index, e) in entity_array.iter().enumerate() {
+            let mut entity = Entity::load_from_json(e, index, &self.device, &self.model_bind_group_layout, registry);
+            entity.set_namespace(namespace.clone());
+            self.entities.push(entity);
         }
+        // Scoped to what this scene contributed. Roots already in the scene are under a namespace
+        // this one cannot have been granted, so they cannot collide with these and renaming them
+        // would break addresses a server is already using.
+        behaviors_and_entities::disambiguate_names(&mut self.entities[first_merged..], "a merged scene");
 
         // Re-run after the merge rather than only at load: a stream camera declared by the first
         // scene collides with an entity that only arrives now.
         self.warn_on_shared_stream_sources();
+        self.log_addressable_paths();
 
         entity_array.len()
+    }
+
+    /// Every path a command can name, parents before their children.
+    pub fn entity_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+        for entity in &self.entities {
+            entity.collect_paths("", &mut paths);
+        }
+        paths
+    }
+
+    /// Logs what is addressable, at debug: a ten-drone fleet is a hundred-odd paths, which is too
+    /// much for a run's normal output but exactly what is wanted when a command misses.
+    fn log_addressable_paths(&self) {
+        let paths = self.entity_paths();
+        debug!("{} addressable entities: {}", paths.len(), paths.join(", "));
+    }
+
+    /// Resolves a slash-separated path — `fleet_a/Drone_02/propeller RRT` — to the entity it names.
+    ///
+    /// Root paths are unique, so the root whose path prefixes this one settles which subtree to
+    /// search; if the rest names nothing in that subtree the answer is `None`, never another
+    /// root's child. Callers are expected to say so loudly: a command that names an entity which
+    /// has been cleared, was never sent, or was renamed by a collision fails no other way.
+    //
+    // Nothing calls this yet — the command frame has no room for a target, so carrying one is the
+    // next protocol change. It ships with the naming it resolves because a name that nothing can
+    // resolve is not an addressing scheme.
+    #[allow(dead_code)]
+    pub fn find_entity_mut(&mut self, path: &str) -> Option<&mut Entity> {
+        for root in &mut self.entities {
+            let prefix = root.qualified_name();
+            if path == prefix {
+                return Some(root);
+            }
+            if let Some(rest) = path.strip_prefix(&prefix).and_then(|r| r.strip_prefix(PATH_SEPARATOR)) {
+                return root.find_descendant_mut(rest);
+            }
+        }
+        None
     }
 
     /// Flushes the staging buffers, closes the encode, and retimes the result.
@@ -1248,6 +1382,68 @@ mod tests {
 
     fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
         raw.iter().map(|(s, c)| (s.to_string(), c.to_string())).collect()
+    }
+
+    fn claim(claimed: &mut HashSet<String>, scene: &str) -> String {
+        claim_namespace(claimed, &serde_json::from_str(scene).unwrap(), "a test scene")
+    }
+
+    #[test]
+    fn a_declared_namespace_is_granted_as_written() {
+        let mut claimed = HashSet::new();
+
+        assert_eq!(claim(&mut claimed, r#"{"namespace": "fleet_a"}"#), "fleet_a");
+        assert_eq!(claim(&mut claimed, r#"{"namespace": "fleet_b"}"#), "fleet_b");
+    }
+
+    // First declarer wins, as with authority — but the loser's entities still have to be
+    // addressable, so it is moved aside rather than left sharing addresses with the winner.
+    #[test]
+    fn a_second_claim_on_one_namespace_is_moved_aside() {
+        let mut claimed = HashSet::new();
+
+        assert_eq!(claim(&mut claimed, r#"{"namespace": "fleet_a"}"#), "fleet_a");
+        assert_eq!(claim(&mut claimed, r#"{"namespace": "fleet_a"}"#), "fleet_a#1");
+        assert_eq!(claim(&mut claimed, r#"{"namespace": "fleet_a"}"#), "fleet_a#2");
+    }
+
+    // Every scene written before namespaces existed declares nothing, and a single-source run of
+    // one must keep addressing entities by bare name.
+    #[test]
+    fn the_first_undeclared_scene_keeps_bare_names() {
+        let mut claimed = HashSet::new();
+
+        assert_eq!(claim(&mut claimed, r#"{"entities": []}"#), "");
+    }
+
+    // Two undeclared scenes cannot both hold the bare-name space without their roots colliding,
+    // so the second is given one of its own.
+    #[test]
+    fn a_second_undeclared_scene_is_given_a_namespace() {
+        let mut claimed = HashSet::new();
+
+        assert_eq!(claim(&mut claimed, r#"{"entities": []}"#), "");
+        assert_eq!(claim(&mut claimed, r#"{"entities": []}"#), "#1");
+        assert_eq!(claim(&mut claimed, r#"{"entities": []}"#), "#2");
+    }
+
+    // A separator in the namespace would split into segments the author never meant, and could
+    // shadow another stream's root path.
+    #[test]
+    fn a_namespace_containing_the_separator_is_substituted() {
+        let mut claimed = HashSet::new();
+
+        assert_eq!(claim(&mut claimed, r#"{"namespace": "fleet/a"}"#), "fleet_a");
+    }
+
+    // Anything that is not a JSON string is not a declaration, matching how `authority` treats
+    // anything that is not a JSON bool.
+    #[test]
+    fn a_non_string_namespace_declares_nothing() {
+        for scene in [r#"{"namespace": 7}"#, r#"{"namespace": null}"#, r#"{"namespace": true}"#] {
+            let mut claimed = HashSet::new();
+            assert_eq!(claim(&mut claimed, scene), "", "scene {} should not declare", scene);
+        }
     }
 
     #[test]
