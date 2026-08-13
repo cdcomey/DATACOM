@@ -151,12 +151,20 @@ authority — see [Command Authority](#command-authority):
 |-------|------|-------------|
 | Message Type | 2 bytes | `0x00 0x06` (COMMAND) |
 | Command | 2 bytes | See the Command Reference below |
+| Payload Length | 4 bytes | Length of the payload in bytes; `0` for a command that takes none |
+| Payload | *n* bytes | UTF-8 JSON; the argument object for this command |
 
 The command id is a separate field rather than its own message type so that adding a command costs
-a value in that table instead of a top-level protocol code, and so a command that later takes
-arguments has somewhere to put them. A command id this client does not recognise is logged and
-ignored; the frame is a fixed four bytes either way, so an unknown one cannot desynchronise the
-stream.
+a value in that table instead of a top-level protocol code.
+
+The length field is what keeps an unknown command harmless. A command id this client does not
+recognise is logged and ignored, and its payload is stepped over using the declared length — so a
+newer server talking to an older client loses that one command rather than desynchronising the
+stream. A payload longer than 64 KiB is treated as a corrupt length field and the frame is dropped.
+
+Payloads are JSON so that a camera behavior means the same thing on the wire as it does in a scene
+file: both go through one decoder, and a behavior that a scene can declare is a behavior a command
+can send.
 
 ### Scene Definition Format
 
@@ -172,8 +180,11 @@ The scene JSON file defines the initial 3D environment and entities. Entities fo
       "w": 1600.0,
       "h": 1200.0,
       "camera": {
+        "name": "main",            // Optional: what commands address this camera by (see below)
         "position": [0.0, -5.0, 5.0],
-        "rotation": [0.85355335, -0.3535534, 0.14644663, -0.3535534]
+        "rotation": [0.85355335, -0.3535534, 0.14644663, -0.3535534],
+        "position_behavior": { "type": "FreeRoam", "speed": 8.0 },
+        "rotation_behavior": { "type": "UserControlled", "sensitivity": 0.4 }
       },
       "border color": [0.0, 255.0, 0.0],
       "alignment": "FullScreen"
@@ -184,9 +195,14 @@ The scene JSON file defines the initial 3D environment and entities. Entities fo
       "w": 400.0,
       "h": 600.0,
       "camera": {
+        "name": "chase",
         "position": [2.7, -5.0, 0.0],
         "rotation": [1.0, 0.0, 0.0, 0.0],
-        "stream": "camera_01.bin"  // Optional: drive this camera from a stream (see below)
+        "position_behavior": {     // this one flies itself and watches a drone
+          "type": "TrackingEntity",
+          "entity": "fleet_a/Drone_01", "distance": 8.0, "direction": [0.0, -1.0, 0.3]
+        },
+        "rotation_behavior": { "type": "FocusedOnEntity", "entity": "fleet_a/Drone_01" }
       },
       "border color": [0.0, 0.0, 255.0],
       "alignment": "BottomRight"
@@ -334,6 +350,78 @@ the trailing one is the record-video flag and the rest are the JSON list.
 Note that this is a coordination mechanism, not a security one: the wire protocol is unauthenticated,
 so authority prevents conflicting or accidental global commands, not hostile ones.
 
+### Camera Control
+
+The stream holding authority — the master — can drive any camera in the scene. Four commands do it,
+all addressing a camera by name and all carrying a JSON payload:
+
+```json
+{ "camera": "chase", "behavior": { "type": "Orbit", "speed": 3.0,
+                                   "direction": [1.0, 0.0, 0.0],
+                                   "point": [0.0, 0.0, 0.0], "distance": 20.0 } }
+{ "camera": "chase", "position": [0.0, -5.0, 5.0] }
+{ "camera": "chase", "rotation": [1.0, 0.0, 0.0, 0.0] }
+```
+
+| Command | Effect |
+|---|---|
+| `UPDATE_CAMERA_POSITION_BEHAVIOR` | Installs a new position behavior. If the outgoing one was `Streamed`, its ring buffer is dropped along with it. |
+| `UPDATE_CAMERA_ROTATION_BEHAVIOR` | The same, for the rotation half. |
+| `UPDATE_CAMERA_POSITION` | Moves the camera, leaving its behavior alone. |
+| `UPDATE_CAMERA_ROTATION` | Aims the camera, leaving its behavior alone. |
+
+Cameras are addressed by the `name` in their viewport's `camera` block, or by `#N` — the viewport's
+index in the `viewports` array — when it declares none. Colliding names are suffixed `#0`, `#1`, …,
+exactly as entity names are, and for the same reason: a command that quietly aimed the wrong
+viewport would be harder to spot than one that visibly aimed nothing. Run with `RUST_LOG=info` to
+log every addressable camera at load.
+
+**A position or rotation command is reconciled with the behavior still running underneath it.** A
+`Streamed` camera has its ring buffer cleared, so the frames already queued do not walk it straight
+back off the commanded pose — but the binding survives, and frames arriving after the clear are
+honoured as usual. That is deliberate: on a live stream, a commanded position holds only until the
+next frame lands. An `Orbit` adopts its new radius rather than snapping back to the declared one, and
+a `TrackingEntity` re-derives its distance and direction from the new position. The two look-at
+rotation behaviors are the exception — they overwrite a commanded rotation on the very next frame,
+since where they aim is not the server's to set one frame at a time.
+
+Every failure is a logged warning and a dropped command, never a partial application: an unknown
+camera name, a malformed payload, a behavior whose geometry does not work out, or an entity that is
+not in the scene. **A command naming an entity that has not connected yet is dropped**, unlike a
+scene-declared behavior, which cannot know what has connected and so resolves late instead. The wire
+is one-way, so the client's log is the only place any of this is reported.
+
+#### Driving cameras from the test server
+
+Two environment variables exercise the path without an external operator. As with the clear, each
+server checks its own scene for `"authority": true` first and logs rather than sends when it is
+missing.
+
+```bash
+# a scripted sequence of camera commands, timed from this server's own TRANSMISSION_END
+DATACOM_TEST_CAMERA_COMMANDS=data/camera_script.json cargo run -- test scene_a.json n
+
+# generated camera poses, streamed under the names a Streamed behavior binds
+DATACOM_TEST_CAMERA_STREAMS=cam_pos.bin,cam_rot.bin cargo run -- test scene_a.json n
+```
+
+The script is an array of steps, each sent `after` that many seconds. Its `payload` is passed to the
+client verbatim, so this exercises the real decoder rather than a test-only shortcut:
+
+```json
+[
+  { "after": 3, "command": "update_camera_rotation_behavior",
+    "payload": { "camera": "main", "behavior": { "type": "FocusedOnPoint", "point": [0, 0, 0] } } },
+  { "after": 6, "command": "update_camera_position_behavior",
+    "payload": { "camera": "main", "behavior": { "type": "Orbit", "speed": 4.0,
+                                                 "direction": [1, 0, 0],
+                                                 "point": [0, 0, 0], "distance": 25.0 } } }
+]
+```
+
+`DATACOM_TEST_CAMERA_STREAMS` takes the position stream name first and the rotation stream name
+second, and feeds both a camera circling the origin and looking inward.
+
 ### Entity Addressing
 
 A command that acts on one entity has to name it, and the name has to mean the same thing on both
@@ -385,8 +473,13 @@ every namespace along with the entities it addressed, so a fleet that reconnects
 original namespace back rather than being pushed aside by its own earlier claim. Run with
 `RUST_LOG=debug` to log every addressable path at load and after each merge.
 
-Note that the `COMMAND` frame has no room for a target yet — it is a fixed four bytes. Carrying a
-path is the next protocol change; this section describes the names it will carry.
+These paths are what a camera's `TrackingEntity` and `FocusedOnEntity` behaviors name, in scene JSON
+and in commands alike. A path resolves to the entity's **world** position, so a child deep in a
+scene graph is as valid a target as a root.
+
+Note that no command yet acts on the entity a path names — the camera behaviors only read them.
+Commands that modify an entity are the next use of this scheme; the addressing they need is already
+here.
 
 ### Live Data Streaming
 
@@ -399,35 +492,94 @@ After the initial file transfer completes, the server can stream indefinite live
 - The same FILE_CHUNK format is used
 - Chunks are written into a per-stream ring buffer; out-of-order chunks are held in a reorder buffer keyed by offset and flushed in order
 
-### Stream-Driven Cameras
+### Camera Behaviors
 
-A viewport camera can be driven by a stream instead of by the user, by naming a source in its
-`camera` block:
+There is exactly one camera per viewport, and what it does is two independent choices: a
+**position behavior** that decides where it is, and a **rotation behavior** that decides where it
+looks. The two never consult each other, so a camera can orbit a point while watching a drone, or
+fly a straight line while spinning on its own axis, without either pairing being a mode someone had
+to add. Both are declared in the scene JSON and both can be replaced at runtime by the master
+server — see [Camera Control](#camera-control).
 
-```json
-"camera": {
-  "position": [0.0, -5.0, 5.0],
-  "rotation": [1.0, 0.0, 0.0, 0.0],
-  "stream": "chase_cam.bin"
-}
-```
+Every direction vector below is normalized on receipt; its magnitude is ignored, with rate carried
+by the behavior's own `speed`. Position is applied before rotation each frame, so a camera that
+looks at something aims from where it ended up rather than from where it was.
 
-The frame layout is identical to a `ChangeTransform` behavior's — 12 f32, big-endian, with
-position in slots 0-2 and the quaternion's vector part in slots 6-8 — and the name is bound in the
-same registry, so no protocol or server change is needed to feed one. A name the server never
-sends fails the same silent way an entity's does: the camera simply never moves.
+#### Position behaviors
 
-Notes:
-- The mode is **locked**. `Enter` will not switch a stream-driven camera into or out of it, and
-  keyboard and mouse input are inert on it. Clicking it still takes focus, and says so.
+| `type` | Fields | Behavior |
+|---|---|---|
+| `Streamed` | `stream` | Position read from a streamed `.bin`, one frame per rendered frame |
+| `Linear` | `speed`, `direction` | Constant-velocity travel along a fixed world-space direction |
+| `Orbit` | `speed`, `direction`, `point`, `distance` | Constant-speed travel around `point` at radius `distance` |
+| `FreeRoam` | `speed` | Driven by the user's keyboard |
+| `TrackingEntity` | `entity`, `distance`, `direction` | Held at a fixed world-space offset from an entity, moving with it |
+
+`Orbit`'s `direction` is the direction of **travel**, not the axis: a camera south of its point,
+upright, told to travel along its own right vector, orbits counter-clockwise in the horizontal
+plane. The axis is derived from that direction and the camera's position once, when the behavior is
+installed, and the camera is snapped to `distance` from `point` at that moment. A direction that
+points along the radius defines no orbital plane and is rejected.
+
+`TrackingEntity`'s offset is world-space deliberately — an entity-relative one would whip the
+camera around every time the entity spun.
+
+#### Rotation behaviors
+
+| `type` | Fields | Behavior |
+|---|---|---|
+| `Streamed` | `stream` | Rotation read from a streamed `.bin`, one frame per rendered frame |
+| `FocusedOnEntity` | `entity` | Always looking at an entity |
+| `FocusedOnPoint` | `point` | Always looking at a fixed point |
+| `UserControlled` | `sensitivity` | Driven by the user's mouse, with `K`/`L` for roll |
+| `AboutOwnAxis` | `axis`, `speed` | Constant-rate spin about a camera-local axis |
+
+`AboutOwnAxis` takes its axis in **camera-local** coordinates, where `+y` is forward and `+z` is up
+— so spinning about the camera's own up-axis is `[0, 0, 1]`, wherever it happens to be pointing.
+
+#### Streamed cameras
+
+The frame layout is identical to a `ChangeTransform` behavior's — 12 f32, big-endian, position in
+slots 0-2 and the quaternion's vector part in slots 6-8 — and the name is bound in the same
+registry, so no protocol change is needed to feed one. A name the server never sends fails the same
+silent way an entity's does: the camera simply never moves.
+
+- **Position and rotation need separate streams.** `next_frame` drains what it reads, so two
+  consumers on one name take alternate frames and each runs at half rate. A camera streaming both
+  halves needs two names, and the server sends the pose twice.
 - `position` and `rotation` still apply until the first frame arrives.
 - A starved stream **holds the last pose** rather than resetting, matching how entities stall.
-- Camera streams do not count toward the run's completion, so a quiet camera will neither hold
-  the session open nor end it early.
-- Two viewports naming the *same* source each consume from one buffer and will halve each other's
-  frame rate. Give each its own name.
-- Only the first scene to arrive defines viewports, so in a multi-source run the declaration must
-  be in whichever scene wins that race — or, more simply, in all of them.
+- Camera streams do not count toward the run's completion, so a quiet camera will neither hold the
+  session open nor end it early.
+
+#### Cameras and the user
+
+Keyboard translation reaches a camera only under `FreeRoam`, and mouse-look only under
+`UserControlled`. Once the master server sets any other behavior, local input is inert on that half
+until the server hands it back — a keypress that yanked a camera out of a server-set behavior would
+leave the server believing it drove a camera it no longer does. A server-driven viewport still
+takes focus when clicked, and says which behaviors hold it.
+
+- `Enter` moves a camera's aim between `UserControlled` and `FocusedOnEntity`, and does nothing at
+  all under the other three rotation behaviors. Focusing **re-aims from where the camera is**; it
+  does not move it.
+- `T` cycles the focused entity through the scene's root entities, wrapping at the end. Roots only,
+  though a command may name any path.
+- Holding a direction key while focused traces something close to an orbit — the camera moves along
+  the tangent and then re-aims, so the radius creeps outward by roughly 8% per revolution at the
+  default speed.
+
+#### Defaults and failures
+
+A viewport that declares neither behavior gets `FreeRoam` and `UserControlled`, and so does a scene
+that declares no `viewports` at all. A behavior that fails to load is reported and replaced with
+the same default rather than being fatal: a viewport is the thing you look through, and refusing to
+open the window over a typo in one camera's speed leaves nothing on screen to read the message
+against.
+
+Only the first scene to arrive defines viewports, so in a multi-source run the declaration must be
+in whichever scene wins that race — or, more simply, in all of them. A camera aimed at an entity
+from a scene that has not arrived yet holds still and logs a warning, retried after every merge.
 
 ## Message Type Reference
 
@@ -443,9 +595,13 @@ Notes:
 
 ### Command Reference
 
-| Command | Code | Description |
-|---------|------|-------------|
-| CLEAR_SCENE | `0x00 0x00` | Remove every entity and the buffers feeding them |
+| Command | Code | Payload | Description |
+|---------|------|---------|-------------|
+| CLEAR_SCENE | `0x00 0x00` | none | Remove every entity and the buffers feeding them |
+| UPDATE_CAMERA_POSITION_BEHAVIOR | `0x00 0x01` | `camera`, `behavior` | Replace what moves a camera |
+| UPDATE_CAMERA_ROTATION_BEHAVIOR | `0x00 0x02` | `camera`, `behavior` | Replace what aims a camera |
+| UPDATE_CAMERA_POSITION | `0x00 0x03` | `camera`, `position` | Move a camera without changing its behavior |
+| UPDATE_CAMERA_ROTATION | `0x00 0x04` | `camera`, `rotation` | Aim a camera without changing its behavior |
 
 ## Architecture
 ```

@@ -22,6 +22,27 @@ use crate::com::{
 /// this without changing what an existing command line means.
 const CLEAR_SCENE_DELAY_VAR: &str = "DATACOM_TEST_CLEAR_AFTER_SECS";
 
+/// Path to a JSON file of timed camera commands, relative to the repo root.
+///
+/// The file is an array of `{ "after": <seconds>, "command": <name>, "payload": <object> }`, each
+/// sent that many seconds after this server's own `TRANSMISSION_END`. The payload is passed to the
+/// client verbatim, so this exercises the real decoder rather than a test-only shortcut — a
+/// payload the client would reject is a payload this rejects too, in the same way.
+const CAMERA_COMMAND_VAR: &str = "DATACOM_TEST_CAMERA_COMMANDS";
+
+/// Comma-separated stream names to feed generated camera poses to: position first, rotation
+/// second. `DATACOM_TEST_CAMERA_STREAMS=cam_pos.bin,cam_rot.bin` gives a `Streamed` camera on
+/// either half something to read.
+const CAMERA_STREAM_VAR: &str = "DATACOM_TEST_CAMERA_STREAMS";
+
+/// Radius and rate of the generated camera path. Wide enough to hold a whole test scene in frame,
+/// slow enough to watch.
+const CAMERA_STREAM_RADIUS: f32 = 15.0;
+const CAMERA_STREAM_RATE: f32 = 0.4;
+/// Pace of the generated camera stream, matched to a 60fps client so one frame is consumed per
+/// rendered frame rather than piling up in the ring buffer.
+const CAMERA_STREAM_INTERVAL: Duration = Duration::from_millis(16);
+
 #[derive(Clone)]
 pub enum StreamMode {
     File(String),
@@ -198,16 +219,186 @@ fn clear_scene_delay() -> Option<Duration> {
 /// Sent once. A scene is transmitted once per stream, so nothing re-populates what the clear
 /// removes and a repeat would land on an already-empty scene.
 fn spawn_clear_scene_timer(socket: Arc<UdpSocket>, delay: Duration) {
+    spawn_command_timer(socket, delay, ServerCommand::CLEAR_SCENE, Vec::new());
+}
+
+/// Sends one command on a timer from its own thread.
+///
+/// A thread rather than a sleep in the streaming loop because that loop never returns for a
+/// generated source — there is no later point in it to reach. The socket is already connected to
+/// the client, so this shares it rather than opening another.
+fn spawn_command_timer(
+    socket: Arc<UdpSocket>,
+    delay: Duration,
+    command: ServerCommand,
+    payload: Vec<u8>,
+) {
     thread::Builder::new()
-        .name("server clear-scene timer".to_string())
+        .name(format!("server {:?} timer", command))
         .spawn(move || {
             thread::sleep(delay);
-            info!("S: sending CLEAR_SCENE");
-            if let Err(e) = socket.send(&encode_command(ServerCommand::CLEAR_SCENE)) {
-                info!("S: CLEAR_SCENE was not sent: {}", e);
+            info!("S: sending {:?}", command);
+            if let Err(e) = socket.send(&encode_command(command, &payload)) {
+                info!("S: {:?} was not sent: {}", command, e);
             }
         })
         .unwrap();
+}
+
+/// Maps a name in the command script onto its wire command.
+///
+/// Spelled out rather than derived from the enum so the script file reads as prose and a typo is
+/// reported against the list of what it could have meant.
+fn command_from_name(name: &str) -> Option<ServerCommand> {
+    match name {
+        "clear_scene" => Some(ServerCommand::CLEAR_SCENE),
+        "update_camera_position_behavior" => Some(ServerCommand::UPDATE_CAMERA_POSITION_BEHAVIOR),
+        "update_camera_rotation_behavior" => Some(ServerCommand::UPDATE_CAMERA_ROTATION_BEHAVIOR),
+        "update_camera_position" => Some(ServerCommand::UPDATE_CAMERA_POSITION),
+        "update_camera_rotation" => Some(ServerCommand::UPDATE_CAMERA_ROTATION),
+        _ => None,
+    }
+}
+
+/// Schedules every command in the script named by `DATACOM_TEST_CAMERA_COMMANDS`.
+///
+/// Delays are measured from this server's own `TRANSMISSION_END`, matching the clear timer, so a
+/// command always lands in the live phase however long the initial transfer took.
+fn schedule_camera_commands(socket: &Arc<UdpSocket>, scene_path: &str) {
+    let Ok(path) = std::env::var(CAMERA_COMMAND_VAR) else { return };
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            info!("S: cannot read {}={:?}: {}", CAMERA_COMMAND_VAR, path, e);
+            return;
+        }
+    };
+
+    let script: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(script) => script,
+        Err(e) => {
+            info!("S: {:?} is not valid JSON: {}", path, e);
+            return;
+        }
+    };
+
+    let Some(steps) = script.as_array() else {
+        info!("S: {:?} must be an array of commands", path);
+        return;
+    };
+
+    // Same reasoning as the clear timer: the client would ignore these anyway, and the reason
+    // belongs on the side that has to change.
+    if !scene_holds_authority(scene_path) {
+        info!(
+            "S: not scheduling {} camera command(s) — {} does not set \"authority\": true, so the \
+             client would ignore them",
+            steps.len(), scene_path,
+        );
+        return;
+    }
+
+    for (i, step) in steps.iter().enumerate() {
+        let Some(command) = step["command"].as_str().and_then(command_from_name) else {
+            info!(
+                "S: skipping command {} of {:?}: {:?} is not one of clear_scene, \
+                 update_camera_position_behavior, update_camera_rotation_behavior, \
+                 update_camera_position, update_camera_rotation",
+                i, path, step["command"],
+            );
+            continue;
+        };
+
+        let delay = Duration::from_secs_f64(step["after"].as_f64().unwrap_or(0.0));
+        let payload = step["payload"].to_string().into_bytes();
+
+        info!("S: {:?} scheduled for {:?} from transmission end", command, delay);
+        spawn_command_timer(Arc::clone(socket), delay, command, payload);
+    }
+}
+
+fn scene_holds_authority(scene_path: &str) -> bool {
+    let full_path = format!("data/scene_loading/{}", scene_path);
+    fs::read(&full_path).map(|scene| scene_declares_authority(&scene)).unwrap_or(false)
+}
+
+/// One transform frame in the wire layout: 12 big-endian f32, position in slots 0-2 and the
+/// quaternion's vector part in slots 6-8.
+fn transform_frame(position: [f32; 3], rotation_vector: [f32; 3]) -> Vec<u8> {
+    let values = [
+        position[0], position[1], position[2],
+        0.0, 0.0, 0.0,
+        rotation_vector[0], rotation_vector[1], rotation_vector[2],
+        0.0, 0.0, 0.0,
+    ];
+    values.iter().flat_map(|v| v.to_be_bytes()).collect()
+}
+
+/// A camera circling the origin and looking inward, as position and rotation frames.
+///
+/// The scalar part is dropped on the wire and reconstructed by the client as `sqrt(1 - |v|²)`,
+/// which is always non-negative — so a quaternion with a negative scalar is negated first. `q` and
+/// `-q` name the same rotation, so this loses nothing, but sending the negative-scalar half
+/// unchanged would have the client reconstruct a different rotation entirely.
+fn camera_pose(t: f32) -> ([f32; 3], [f32; 3]) {
+    use cgmath::{InnerSpace, Matrix3, Quaternion, Vector3};
+
+    let angle = t * CAMERA_STREAM_RATE;
+    let position = [
+        CAMERA_STREAM_RADIUS * angle.cos(),
+        CAMERA_STREAM_RADIUS * angle.sin(),
+        CAMERA_STREAM_RADIUS * 0.4,
+    ];
+
+    let forward = -Vector3::new(position[0], position[1], position[2]).normalize();
+    let right = forward.cross(Vector3::unit_z()).normalize();
+    let up = right.cross(forward);
+    let q = Quaternion::from(Matrix3::from_cols(right, forward, up)).normalize();
+    let q = if q.s < 0.0 { -q } else { q };
+
+    (position, [q.v.x, q.v.y, q.v.z])
+}
+
+/// Feeds generated camera poses to the stream names in `DATACOM_TEST_CAMERA_STREAMS`.
+///
+/// One thread per name, sharing the socket: each datagram carries one whole frame and is sent
+/// atomically, so the client demultiplexes them by file id exactly as it does two drones'.
+fn spawn_camera_streams(socket: &Arc<UdpSocket>) {
+    let Ok(names) = std::env::var(CAMERA_STREAM_VAR) else { return };
+
+    let names: Vec<String> = names
+        .split(',')
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    for (half, name) in names.into_iter().enumerate() {
+        let socket = Arc::clone(socket);
+        // Slot 0 is the position stream and slot 1 the rotation stream. They are separate names
+        // because a single buffer read by two consumers is drained by whichever gets there first,
+        // so the two halves would each see every other frame.
+        let is_position = half == 0;
+
+        thread::Builder::new()
+            .name(format!("server camera stream ({})", name))
+            .spawn(move || {
+                info!("S: streaming generated camera {} to {}",
+                    if is_position { "positions" } else { "rotations" }, name);
+                let mut frame: u64 = 0;
+                send_streaming_data(&socket, &name, 0, 0, || {
+                    let (position, rotation) = camera_pose(frame as f32 * CAMERA_STREAM_INTERVAL.as_secs_f32());
+                    frame += 1;
+                    thread::sleep(CAMERA_STREAM_INTERVAL);
+                    Some(if is_position {
+                        transform_frame(position, [0.0; 3])
+                    } else {
+                        transform_frame([0.0; 3], rotation)
+                    })
+                });
+            })
+            .unwrap();
+    }
 }
 
 /// Schedules the clear only if this server's own scene claims authority, mirroring the rule the
@@ -220,8 +411,7 @@ fn spawn_clear_scene_timer(socket: Arc<UdpSocket>, delay: Duration) {
 fn schedule_clear_scene(socket: &Arc<UdpSocket>, scene_path: &str) {
     let Some(delay) = clear_scene_delay() else { return };
 
-    let full_path = format!("data/scene_loading/{}", scene_path);
-    if fs::read(&full_path).map(|scene| scene_declares_authority(&scene)).unwrap_or(false) {
+    if scene_holds_authority(scene_path) {
         info!("S: {} holds command authority; CLEAR_SCENE in {:?}", scene_path, delay);
         spawn_clear_scene_timer(Arc::clone(socket), delay);
     } else {
@@ -300,6 +490,8 @@ pub fn create_server_thread(
                 // against the live phase the client will actually honour a command in: anything
                 // sent before this server's TRANSMISSION_END is dropped as initial-transfer noise.
                 schedule_clear_scene(&socket, &json_file_path);
+                schedule_camera_commands(&socket, &json_file_path);
+                spawn_camera_streams(&socket);
 
                 thread::sleep(Duration::from_secs(1));
 

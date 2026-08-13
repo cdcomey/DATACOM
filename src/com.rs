@@ -38,7 +38,16 @@ const CHUNK_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_
 const FILE_END_METADATA_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH;
 const RETRANSMIT_REQUEST_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + FILE_ID_BYTE_WIDTH + CHUNK_OFFSET_BYTE_WIDTH;
 const COMMAND_ID_BYTE_WIDTH: usize = 2;
-const COMMAND_BYTE_WIDTH: usize = MESSAGE_TYPE_BYTE_WIDTH + COMMAND_ID_BYTE_WIDTH;
+const COMMAND_PAYLOAD_LENGTH_BYTE_WIDTH: usize = 4;
+const COMMAND_HEADER_BYTE_WIDTH: usize =
+    MESSAGE_TYPE_BYTE_WIDTH + COMMAND_ID_BYTE_WIDTH + COMMAND_PAYLOAD_LENGTH_BYTE_WIDTH;
+/// Ceiling on a command's declared payload length.
+///
+/// A command payload is a short JSON object — a camera name and a behavior — so anything at this
+/// scale is a corrupt length field rather than a real frame. Without the cap, a bogus length makes
+/// the assembly thread wait out its full timeout for bytes that will never come, and then retry
+/// forever on the same header.
+const MAX_COMMAND_PAYLOAD_BYTE_WIDTH: usize = 64 * 1024;
 const CHECKSUM_WIDTH: usize = 4;
 
 const SECONDS_UNTIL_TIMEOUT: u64 = 30;
@@ -95,16 +104,19 @@ impl MessageType {
     }
 }
 
-/// A global operation the scene-wide state, rather than one file's transfer, is subject to.
+/// An operation the scene-wide state, rather than one file's transfer, is subject to.
 ///
 /// Carried in a `COMMAND` frame's payload rather than as its own `MessageType` so that adding one
-/// costs a value here instead of a top-level protocol code, and so a command that later needs
-/// arguments has somewhere to put them.
+/// costs a value here instead of a top-level protocol code.
 #[allow(non_camel_case_types)]
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerCommand {
     CLEAR_SCENE,
+    UPDATE_CAMERA_POSITION_BEHAVIOR,
+    UPDATE_CAMERA_ROTATION_BEHAVIOR,
+    UPDATE_CAMERA_POSITION,
+    UPDATE_CAMERA_ROTATION,
     /// Any code this build does not recognise. Kept as a value rather than an error so a newer
     /// server talking to an older client is ignored loudly instead of desynchronising the stream.
     UNKNOWN,
@@ -114,6 +126,10 @@ impl ServerCommand {
     fn get_from_bytes(value: u16) -> Self {
         match value {
             0 => ServerCommand::CLEAR_SCENE,
+            1 => ServerCommand::UPDATE_CAMERA_POSITION_BEHAVIOR,
+            2 => ServerCommand::UPDATE_CAMERA_ROTATION_BEHAVIOR,
+            3 => ServerCommand::UPDATE_CAMERA_POSITION,
+            4 => ServerCommand::UPDATE_CAMERA_ROTATION,
             _ => ServerCommand::UNKNOWN,
         }
     }
@@ -123,16 +139,22 @@ impl ServerCommand {
     }
 }
 
-/// Builds the `COMMAND` frame that carries `command`.
+/// Builds the `COMMAND` frame that carries `command` and its JSON `payload`.
 ///
 /// The sole construction site for a command frame, mirroring `MessageType::to_be_bytes`: the frame
 /// is small enough that hand-assembling it at each sender looks harmless, and a sender that laid
-/// the two fields out differently would decode as a valid frame carrying the wrong command rather
+/// the fields out differently would decode as a valid frame carrying the wrong command rather
 /// than as an error.
-pub fn encode_command(command: ServerCommand) -> [u8; COMMAND_BYTE_WIDTH] {
-    let mut frame = [0u8; COMMAND_BYTE_WIDTH];
-    frame[0..MESSAGE_TYPE_BYTE_WIDTH].copy_from_slice(&MessageType::COMMAND.to_be_bytes());
-    frame[MESSAGE_TYPE_BYTE_WIDTH..COMMAND_BYTE_WIDTH].copy_from_slice(&command.to_be_bytes());
+///
+/// The length field is what lets a client skip a command it does not understand. Without it, a
+/// newer server's command would leave its payload sitting in the buffer to be misread as the next
+/// frame's message type — so the length is written even for the commands that take no arguments.
+pub fn encode_command(command: ServerCommand, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(COMMAND_HEADER_BYTE_WIDTH + payload.len());
+    frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
+    frame.extend_from_slice(&command.to_be_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
     frame
 }
 
@@ -280,9 +302,10 @@ pub enum AssemblyMessage {
     // a stream that had already joined has signalled the end of its data
     StreamFinished,
     SceneFileAssembled(String),
-    // a global command from the stream holding command authority; already gated, so a receiver
-    // that sees one may act on it without rechecking who sent it
-    Command(ServerCommand),
+    // a command from the stream holding command authority, with its JSON payload (empty for the
+    // commands that take no arguments); already gated, so a receiver that sees one may act on it
+    // without rechecking who sent it
+    Command(ServerCommand, String),
 }
 
 // What a single `receive_file` dispatch produced for the assembly thread to act on. One datagram
@@ -297,8 +320,9 @@ pub enum ReceiveOutcome {
     SceneFile { name: String, data: Vec<u8> },
     // the server signalled TRANSMISSION_END and has been ACKed
     TransmissionComplete,
-    // a decoded command frame, not yet checked against this stream's authority
-    Command(ServerCommand),
+    // a command frame with its payload still undecoded, not yet checked against this stream's
+    // authority
+    Command { command: ServerCommand, payload: Vec<u8> },
 }
 
 // A server declares itself the command authority with a top-level `"authority": true` in its scene
@@ -340,14 +364,22 @@ pub fn create_assembly_thread(
                 // Gated here rather than on the main thread because authority is per-stream: this
                 // thread is the only one that knows whether the socket the command arrived on is
                 // the one holding it. Everything forwarded past this point is already authorised.
-                ReceiveOutcome::Command(command) => {
+                ReceiveOutcome::Command { command, payload } => {
                     if !has_authority {
                         warn!("ignoring {:?} from a stream that does not hold command authority", command);
                     } else if command == ServerCommand::UNKNOWN {
                         warn!("ignoring an unrecognised command from the authority stream");
                     } else {
-                        info!("forwarding {:?} from the authority stream", command);
-                        let _ = tx_main.send(AssemblyMessage::Command(command));
+                        // Rejected at the wire rather than forwarded, because this is the one
+                        // thing about a payload that can be judged without the scene: a command
+                        // whose arguments are not text cannot be a command this client can act on.
+                        match String::from_utf8(payload) {
+                            Ok(payload) => {
+                                info!("forwarding {:?} from the authority stream", command);
+                                let _ = tx_main.send(AssemblyMessage::Command(command, payload));
+                            }
+                            Err(_) => warn!("ignoring {:?}: its payload is not valid UTF-8", command),
+                        }
                     }
                 }
 
@@ -589,13 +621,21 @@ fn finish_receiving_transmission(buf: &mut Vec<u8>){
     buf.drain(0..MESSAGE_TYPE_BYTE_WIDTH);
 }
 
-/// Reads the command id that follows a `COMMAND` message type.
+/// Reads the command id and payload that follow a `COMMAND` message type.
 ///
 /// Returns `None` only when the rest of the frame has not arrived yet, leaving `buf` untouched so
-/// the next call resumes where this one stopped. A command frame is four bytes and arrives in one
+/// the next call resumes where this one stopped. A command frame is small and arrives in one
 /// datagram, so that is a formality rather than a path worth expecting.
-fn receive_command(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::time::Instant) -> Option<ServerCommand> {
-    while buf.len() < COMMAND_BYTE_WIDTH && !has_timed_out(start_time) {
+///
+/// The payload is returned undecoded. What is in it depends on the command, and the two consumers
+/// that could check it — a camera name and an entity path — are both scene state living on the
+/// main thread, so validating half of it here would only split the reporting in two.
+fn receive_command(
+    rx: &Receiver<Vec<u8>>,
+    buf: &mut Vec<u8>,
+    start_time: std::time::Instant,
+) -> Option<(ServerCommand, Vec<u8>)> {
+    while buf.len() < COMMAND_HEADER_BYTE_WIDTH && !has_timed_out(start_time) {
         let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
             return None
         };
@@ -603,16 +643,50 @@ fn receive_command(rx: &Receiver<Vec<u8>>, buf: &mut Vec<u8>, start_time: std::t
         buf.extend_from_slice(&msg);
     }
 
-    if buf.len() < COMMAND_BYTE_WIDTH {
+    if buf.len() < COMMAND_HEADER_BYTE_WIDTH {
         return None;
     }
 
-    let id_bytes: [u8; COMMAND_ID_BYTE_WIDTH] = buf[MESSAGE_TYPE_BYTE_WIDTH..COMMAND_BYTE_WIDTH]
+    let mut counter = MESSAGE_TYPE_BYTE_WIDTH;
+    let id_bytes: [u8; COMMAND_ID_BYTE_WIDTH] = buf[counter..counter+COMMAND_ID_BYTE_WIDTH]
         .try_into()
         .unwrap();
-    buf.drain(0..COMMAND_BYTE_WIDTH);
+    counter += COMMAND_ID_BYTE_WIDTH;
+    let length_bytes: [u8; COMMAND_PAYLOAD_LENGTH_BYTE_WIDTH] = buf[counter..counter+COMMAND_PAYLOAD_LENGTH_BYTE_WIDTH]
+        .try_into()
+        .unwrap();
 
-    Some(ServerCommand::get_from_bytes(u16::from_be_bytes(id_bytes)))
+    let command = ServerCommand::get_from_bytes(u16::from_be_bytes(id_bytes));
+    let payload_length = u32::from_be_bytes(length_bytes) as usize;
+
+    // A length this large is a corrupt field, not a payload. Drop the header and resynchronise on
+    // whatever follows rather than blocking on bytes that are never going to arrive.
+    if payload_length > MAX_COMMAND_PAYLOAD_BYTE_WIDTH {
+        warn!(
+            "discarding a {:?} frame declaring a {} byte payload; the ceiling is {}",
+            command, payload_length, MAX_COMMAND_PAYLOAD_BYTE_WIDTH,
+        );
+        drain_frame(buf, COMMAND_HEADER_BYTE_WIDTH);
+        return None;
+    }
+
+    let frame_width = COMMAND_HEADER_BYTE_WIDTH + payload_length;
+    while buf.len() < frame_width && !has_timed_out(start_time) {
+        let Ok(msg) = rx.recv_timeout(ASSEMBLY_POLL_INTERVAL) else {
+            return None
+        };
+
+        buf.extend_from_slice(&msg);
+    }
+
+    if buf.len() < frame_width {
+        return None;
+    }
+
+    let payload = buf[COMMAND_HEADER_BYTE_WIDTH..frame_width].to_vec();
+    buf.drain(0..frame_width);
+
+    Some((command, payload))
 }
 
 fn json_pretty(value: &serde_json::Value, depth: usize) -> String {
@@ -771,7 +845,7 @@ pub fn receive_file(
         MessageType::COMMAND => {
             debug!("L: received COMMAND");
             match receive_command(&rx_main, buf, start_time) {
-                Some(command) => ReceiveOutcome::Command(command),
+                Some((command, payload)) => ReceiveOutcome::Command { command, payload },
                 None => ReceiveOutcome::Nothing,
             }
         },
@@ -978,33 +1052,56 @@ mod tests {
 
     #[test]
     fn a_command_frame_is_decoded_and_drained() {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
-        frame.extend_from_slice(&ServerCommand::CLEAR_SCENE.to_be_bytes());
-        assert_eq!(frame.len(), COMMAND_BYTE_WIDTH);
+        let frame = encode_command(ServerCommand::CLEAR_SCENE, b"");
 
         let (outcome, buf) = dispatch_buffered_frame(frame);
 
-        assert!(matches!(outcome, ReceiveOutcome::Command(ServerCommand::CLEAR_SCENE)));
+        assert!(matches!(
+            outcome,
+            ReceiveOutcome::Command { command: ServerCommand::CLEAR_SCENE, .. },
+        ));
         assert!(buf.is_empty(), "the command frame must not be re-dispatched");
     }
 
-    // A newer server's command reaching an older client. It has to decode to something and come off
-    // the buffer, or the assembly thread spins on it the way an undrained ERROR frame would.
     #[test]
-    fn an_unrecognised_command_id_is_drained() {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
-        frame.extend_from_slice(&999u16.to_be_bytes());
+    fn a_payload_survives_the_round_trip() {
+        let json = br#"{"camera": "chase", "position": [1.0, 2.0, 3.0]}"#;
+        let frame = encode_command(ServerCommand::UPDATE_CAMERA_POSITION, json);
 
         let (outcome, buf) = dispatch_buffered_frame(frame);
 
-        assert!(matches!(outcome, ReceiveOutcome::Command(ServerCommand::UNKNOWN)));
+        match outcome {
+            ReceiveOutcome::Command { command, payload } => {
+                assert_eq!(command, ServerCommand::UPDATE_CAMERA_POSITION);
+                assert_eq!(payload, json.to_vec());
+            }
+            _ => panic!("payload command did not decode"),
+        }
         assert!(buf.is_empty());
     }
 
-    // The one case that must *not* drain: half a frame is resumable, and dropping those two bytes
-    // would leave the command id at offset 0 to be misread as a message type.
+    // A newer server's command reaching an older client. The length field is what makes this
+    // recoverable: the client cannot interpret the payload but can still step over it, so the
+    // bytes after it are read as the next frame rather than as garbage.
+    #[test]
+    fn an_unrecognised_command_skips_its_payload() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
+        frame.extend_from_slice(&999u16.to_be_bytes());
+        frame.extend_from_slice(&12u32.to_be_bytes());
+        frame.extend_from_slice(b"who knows???");
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(
+            outcome,
+            ReceiveOutcome::Command { command: ServerCommand::UNKNOWN, .. },
+        ));
+        assert!(buf.is_empty(), "the unknown command's payload must not be re-dispatched");
+    }
+
+    // The one case that must *not* drain: half a frame is resumable, and dropping those bytes
+    // would leave the rest of the header at offset 0 to be misread as a message type.
     #[test]
     fn a_partial_command_frame_is_left_for_the_next_call() {
         let frame = MessageType::COMMAND.to_be_bytes().to_vec();
@@ -1015,27 +1112,74 @@ mod tests {
         assert_eq!(buf.len(), MESSAGE_TYPE_BYTE_WIDTH, "the type field waits for its payload");
     }
 
+    // A header whose payload has not landed yet is resumable too, and must not be consumed.
+    #[test]
+    fn a_command_awaiting_its_payload_is_left_for_the_next_call() {
+        let mut frame = encode_command(ServerCommand::UPDATE_CAMERA_POSITION, b"{\"a\": 1}");
+        frame.truncate(COMMAND_HEADER_BYTE_WIDTH + 2);
+        let expected = frame.len();
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Nothing));
+        assert_eq!(buf.len(), expected, "a half-arrived payload waits for the rest");
+    }
+
+    // A corrupt length field would otherwise block the assembly thread on bytes that are never
+    // coming, and then re-block on the same header on every retry.
+    #[test]
+    fn an_oversized_payload_length_is_discarded() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MessageType::COMMAND.to_be_bytes());
+        frame.extend_from_slice(&ServerCommand::UPDATE_CAMERA_POSITION.to_be_bytes());
+        frame.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let (outcome, buf) = dispatch_buffered_frame(frame);
+
+        assert!(matches!(outcome, ReceiveOutcome::Nothing));
+        assert!(buf.is_empty(), "the bogus header must not be re-dispatched forever");
+    }
+
     // The encoder and the decoder are the two halves of one frame layout, written in different
     // files. A field width or order that drifted on one side would still decode here as a valid
     // frame carrying the wrong command, so pin them against each other rather than separately.
     #[test]
-    fn an_encoded_command_decodes_back_to_itself() {
-        for command in [ServerCommand::CLEAR_SCENE] {
-            let (outcome, buf) = dispatch_buffered_frame(encode_command(command).to_vec());
+    fn every_encoded_command_decodes_back_to_itself() {
+        for command in [
+            ServerCommand::CLEAR_SCENE,
+            ServerCommand::UPDATE_CAMERA_POSITION_BEHAVIOR,
+            ServerCommand::UPDATE_CAMERA_ROTATION_BEHAVIOR,
+            ServerCommand::UPDATE_CAMERA_POSITION,
+            ServerCommand::UPDATE_CAMERA_ROTATION,
+        ] {
+            let (outcome, buf) = dispatch_buffered_frame(encode_command(command, b"{}"));
 
             match outcome {
-                ReceiveOutcome::Command(decoded) => assert_eq!(decoded, command),
+                ReceiveOutcome::Command { command: decoded, payload } => {
+                    assert_eq!(decoded, command);
+                    assert_eq!(payload, b"{}".to_vec());
+                }
                 _ => panic!("{:?} did not encode to a command frame", command),
             }
-            assert!(buf.is_empty(), "the frame is exactly {} bytes", COMMAND_BYTE_WIDTH);
+            assert!(buf.is_empty(), "{:?} left bytes behind", command);
         }
     }
 
+    // The codes are the protocol contract in README.md; the enum discriminants encode them, so a
+    // variant inserted in the middle would silently renumber every later command.
     #[test]
     fn server_command_codes_match_the_wire_protocol() {
-        assert_eq!(ServerCommand::CLEAR_SCENE.to_be_bytes(), 0u16.to_be_bytes());
-        assert_eq!(ServerCommand::get_from_bytes(0), ServerCommand::CLEAR_SCENE);
-        assert_eq!(ServerCommand::get_from_bytes(1), ServerCommand::UNKNOWN);
+        for (command, code) in [
+            (ServerCommand::CLEAR_SCENE, 0u16),
+            (ServerCommand::UPDATE_CAMERA_POSITION_BEHAVIOR, 1),
+            (ServerCommand::UPDATE_CAMERA_ROTATION_BEHAVIOR, 2),
+            (ServerCommand::UPDATE_CAMERA_POSITION, 3),
+            (ServerCommand::UPDATE_CAMERA_ROTATION, 4),
+        ] {
+            assert_eq!(command.to_be_bytes(), code.to_be_bytes(), "{:?} encodes wrongly", command);
+            assert_eq!(ServerCommand::get_from_bytes(code), command, "code {} decodes wrongly", code);
+        }
+        assert_eq!(ServerCommand::get_from_bytes(999), ServerCommand::UNKNOWN);
     }
 
     // The wire codes are the protocol contract in README.md; the enum discriminants now encode

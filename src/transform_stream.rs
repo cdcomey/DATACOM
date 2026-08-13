@@ -145,6 +145,18 @@ impl TransformStream {
         Some(frame)
     }
 
+    /// Drops the frames a live stream has buffered without unbinding it, so anything that arrives
+    /// after the call still lands. Used when the master server commands a camera to a position or
+    /// rotation of its own: the queued frames describe where the camera *was* going, and replaying
+    /// them would walk it straight back off the commanded pose.
+    ///
+    /// A no-op for the eager sources, whose frames are the whole of what they will ever yield.
+    pub fn clear_buffer(&mut self) {
+        if let Some(ref buffer) = self.buffer {
+            buffer.lock().unwrap().clear_whole_frames();
+        }
+    }
+
     /// Whether this stream can never yield another frame.
     ///
     /// A live buffer that is merely empty still counts as exhausted: the network path uses this to
@@ -268,6 +280,38 @@ mod tests {
         let mut stream = TransformStream::from_values(frame_values(3.0));
 
         stream.rebind(&registry);
+
+        assert_eq!(stream.next_frame().map(|f| f.to_vec()), Some(frame_values(3.0)));
+    }
+
+    // What `update_camera_position` needs: the queued frames describe where the camera was going
+    // and must not walk it off the commanded pose, but the binding survives so the camera resumes
+    // the moment the server sends more.
+    #[test]
+    fn clearing_a_live_stream_drops_its_frames_without_unbinding_it() {
+        let registry = ring_buffer::new_registry();
+        let mut stream = TransformStream::from_registry("camera_pos.bin", &registry);
+        let write = |values: Vec<f32>| {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+            registry.lock().unwrap().get("camera_pos.bin").unwrap().lock().unwrap().write(&bytes);
+        };
+        write(frame_values(1.0));
+
+        stream.clear_buffer();
+
+        assert_eq!(stream.next_frame(), None, "the queued frame is gone");
+        write(frame_values(2.0));
+        assert_eq!(
+            stream.next_frame().map(|f| f.to_vec()), Some(frame_values(2.0)),
+            "but frames arriving after the clear still land",
+        );
+    }
+
+    #[test]
+    fn clearing_an_eager_stream_is_a_no_op() {
+        let mut stream = TransformStream::from_values(frame_values(3.0));
+
+        stream.clear_buffer();
 
         assert_eq!(stream.next_frame().map(|f| f.to_vec()), Some(frame_values(3.0)));
     }

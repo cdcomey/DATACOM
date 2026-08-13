@@ -206,6 +206,26 @@ pub fn disambiguate_names(entities: &mut [Entity], context: &str) {
     }
 }
 
+/// World-space position of the entity a path names, or `None` if it names nothing.
+///
+/// Resolved fresh on every call rather than cached behind a handle, because a cached one cannot be
+/// right for a child: an entity's stored position is relative to its parent, so a child's world
+/// position only exists once the ancestor chain above it has been composed. Recomputing also means
+/// a camera aimed at an entity that has not connected yet starts working the moment it does, and
+/// stops — holding still rather than following a corpse — when a scene clear takes it away.
+pub fn world_position(entities: &[Entity], path: &str) -> Option<Point3<f32>> {
+    for root in entities {
+        let prefix = root.qualified_name();
+        if path == prefix {
+            return root.world_position_of("", Matrix4::identity());
+        }
+        if let Some(rest) = path.strip_prefix(&prefix).and_then(|r| r.strip_prefix(PATH_SEPARATOR)) {
+            return root.world_position_of(rest, Matrix4::identity());
+        }
+    }
+    None
+}
+
 pub struct Entity {
     name: String,
     /// The namespace this entity's subtree is addressed under, set on roots only. A child's
@@ -458,6 +478,27 @@ impl Entity {
             Some(tail) => child.find_descendant_mut(tail),
             None => Some(child),
         }
+    }
+
+    /// World-space position of the descendant `path` names, or of this entity when `path` is empty.
+    ///
+    /// `parent_matrix` is the composed transform of everything above this entity, matching what
+    /// `draw_with_parent_matrix` builds — so the answer is where the entity is actually drawn,
+    /// not the parent-relative offset its own field holds.
+    pub fn world_position_of(&self, path: &str, parent_matrix: Matrix4<f32>) -> Option<Point3<f32>> {
+        let own_matrix = parent_matrix * self.to_matrix();
+
+        if path.is_empty() {
+            return Some(Point3::from_vec(own_matrix.w.truncate()));
+        }
+
+        let (segment, rest) = match path.split_once(PATH_SEPARATOR) {
+            Some((head, tail)) => (head, tail),
+            None => (path, ""),
+        };
+
+        let child = self.children.iter().find(|c| c.name == segment)?;
+        child.world_position_of(rest, own_matrix)
     }
 
     /// Appends this entity's full path and every descendant's, depth first.

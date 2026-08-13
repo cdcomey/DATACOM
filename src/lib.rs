@@ -15,6 +15,7 @@ mod scene;
 mod state;
 mod model;
 mod camera;
+mod camera_behavior;
 mod com;
 mod text;
 mod server_test;
@@ -271,7 +272,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                 // from; there is no scene to act on yet. Warned rather than dropped silently: the
                 // symptom of ignoring one is that pre-command scene data stays on screen, which
                 // looks exactly like a command that ran and did nothing.
-                com::AssemblyMessage::Command(command) => {
+                com::AssemblyMessage::Command(command, _) => {
                     log::warn!(
                         "ignoring {:?}: commands are only accepted once a stream is live, not \
                          during the initial file transfer",
@@ -406,7 +407,7 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                         let added = state.scene.append_entities_from_json_str(&json, &registry);
                         info!("merged {} entities from a mid-session stream", added);
                     }
-                    com::AssemblyMessage::Command(com::ServerCommand::CLEAR_SCENE) => {
+                    com::AssemblyMessage::Command(com::ServerCommand::CLEAR_SCENE, _) => {
                         // Reported rather than done quietly: a stream that joined moments before
                         // this lands is wiped by it, and the count is the only trace of that. The
                         // server is not told, so the log is where a vanished drone shows up.
@@ -414,8 +415,11 @@ pub fn run_scene_from_network(args: Vec<String>, should_save_to_file: bool){
                         state.scene.clear(&registry);
                         info!("cleared the scene ({} entities removed)", removed);
                     }
-                    com::AssemblyMessage::Command(command) => {
-                        log::warn!("no handler for {:?}", command);
+                    // The camera commands share one handler because they share every failure mode
+                    // — an unknown camera, a malformed payload, an entity that is not there — and
+                    // splitting them would mean writing that reporting four times.
+                    com::AssemblyMessage::Command(command, payload) => {
+                        state.scene.apply_camera_command(command, &payload, &registry);
                     }
                 }
             }

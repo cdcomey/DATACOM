@@ -7,12 +7,10 @@ use winit::{
     window::Window,
 };
 use wgpu::TextureUsages;
-use cgmath::{Deg, Quaternion, Rotation3};
 
 use crate::model::ModelVertex;
 use crate::scene::Scene;
 use crate::model;
-use crate::camera;
 use crate::text::GlyphVertex;
 
 use model::{Vertex, DrawModel};
@@ -555,27 +553,25 @@ impl<'a> State<'a> {
                     return true;
                 }
 
-                // Watch the mode across the keypress rather than keying off Enter, so the message
-                // stays correct wherever the switch is triggered from and never fires when
-                // `switch_mode` declines to switch.
+                // Watch the behaviors across the keypress rather than keying off Enter, so the
+                // message stays correct wherever the change is triggered from and never fires
+                // when the keypress declines to change anything — which is what `Enter` does on
+                // a camera the master server owns.
                 //
                 // Indexed rather than routed through `focused_camera`, so the borrow stays
                 // scoped to `viewports` and `process_keyboard` can still take `&entities`.
                 let focused = self.scene.focused_viewport();
-                let mode_before = self.scene.viewports[focused].camera_controller.mode();
+                let before = self.scene.viewports[focused].camera_controller.describe();
                 let handled = self.scene.viewports[focused].camera_controller
                     .process_keyboard(*key, *state, &self.scene.entities);
-                let mode_after = self.scene.viewports[focused].camera_controller.mode();
+                let after = self.scene.viewports[focused].camera_controller.describe();
 
                 let cycled = *key == KeyCode::KeyT
                     && *state == ElementState::Pressed
-                    && mode_after == camera::CameraMode::OrbitPoint;
+                    && self.scene.viewports[focused].camera_controller.focus_target().is_some();
 
-                if mode_after != mode_before {
-                    let msg = self.viewport_toast(
-                        focused,
-                        format!("Switched camera to {}", mode_after.display_name()),
-                    );
+                if after != before {
+                    let msg = self.viewport_toast(focused, format!("Camera: {}", after));
                     self.scene.show_toast(msg);
                 } else if cycled {
                     // Reported on every press rather than only when the target actually moved.
@@ -584,12 +580,13 @@ impl<'a> State<'a> {
                     // from the binding being broken. Re-showing the current target says "that
                     // worked, there is just nowhere else to go".
                     //
-                    // Skipped when the mode changed: entering OrbitPoint already implies a
-                    // target, and toasts share one slot, so this would erase that message.
-                    let entity = self.scene.viewports[focused].camera_controller.orbit_target()
-                        .and_then(|i| self.scene.entities.get(i))
-                        .map_or("?".to_string(), |e| e.name().to_string());
-                    let msg = self.viewport_toast(focused, format!("Orbiting {}", entity));
+                    // Skipped when the behavior changed: the message above already names the
+                    // target, and toasts share one slot, so this would erase it.
+                    let entity = self.scene.viewports[focused].camera_controller
+                        .focus_target()
+                        .unwrap_or("?")
+                        .to_string();
+                    let msg = self.viewport_toast(focused, format!("Focused on {}", entity));
                     self.scene.show_toast(msg);
                 }
 
@@ -615,15 +612,15 @@ impl<'a> State<'a> {
                         self.cursor_position.y as f32,
                     ) {
                         if self.scene.focus_viewport(hit) {
-                            let mode = self.scene.viewports[hit].camera_controller.mode();
-                            // A stream-driven viewport still takes focus, but saying "now
+                            let controller = &self.scene.viewports[hit].camera_controller;
+                            // A server-driven viewport still takes focus, but saying "now
                             // controlling" would be a lie. Refusing focus instead would be worse:
-                            // a click on a full-screen stream view would land on nothing at all
-                            // and look like the click was dropped.
-                            let msg = if mode.accepts_input() {
-                                format!("Now controlling ({})", mode.display_name())
+                            // a click on a full-screen server-driven view would land on nothing
+                            // at all and look like the click was dropped.
+                            let msg = if controller.accepts_input() {
+                                format!("Now controlling ({})", controller.describe())
                             } else {
-                                "Camera is stream-driven".to_string()
+                                format!("Camera is server-driven ({})", controller.describe())
                             };
                             let msg = self.viewport_toast(hit, msg);
                             self.scene.show_toast(msg);
@@ -648,9 +645,7 @@ impl<'a> State<'a> {
     }
 
     pub fn update(&mut self, dt: std::time::Duration, should_save_to_file: bool) {
-        for viewport in &mut self.scene.viewports {
-            viewport.update_camera(dt, &self.queue);
-        }
+        self.scene.update_cameras(dt, &self.queue);
 
         self.framerate = dt.as_secs_f32().recip();
         let fr_str = format!("{:.1} fps", self.framerate);

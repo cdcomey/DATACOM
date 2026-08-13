@@ -31,6 +31,20 @@ impl RingBuffer {
         self.data.drain(..take).collect()
     }
 
+    /// Discards everything buffered **except** a partial trailing frame.
+    ///
+    /// The remainder is deliberately kept. A ring buffer holds a byte stream whose front is always
+    /// a frame boundary, and chunks do not divide evenly into frames — 1024 bytes against 48 — so
+    /// a chunk almost always leaves a partial frame at the tail. Dropping those bytes too would
+    /// shift every byte that arrives afterwards by the length of the remainder, and since nothing
+    /// on the wire marks where a frame begins, the stream would decode as plausible garbage from
+    /// that point on with nothing reporting an error. Losing the whole frames is the point of the
+    /// call; losing frame alignment is not.
+    pub fn clear_whole_frames(&mut self) {
+        let aligned = self.data.len() - (self.data.len() % FRAME_BYTE_WIDTH);
+        self.data.drain(..aligned);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -95,6 +109,46 @@ mod tests {
         let map = registry.lock().unwrap();
         let survivor = map.get("drone1.bin").expect("entry outlives the behavior that used it");
         assert!(!survivor.lock().unwrap().is_empty(), "buffered frames outlive it too");
+    }
+
+    // The hazard the partial-frame remainder exists for. A chunk is 1024 bytes and a frame is 48,
+    // so a clear almost always lands mid-frame; dropping those bytes too would shift every frame
+    // that arrived afterwards, and nothing on the wire marks where a frame begins, so the stream
+    // would decode as plausible garbage from that point on.
+    #[test]
+    fn clearing_preserves_frame_alignment() {
+        let mut buffer = RingBuffer::new();
+        // two whole frames and the head of a third, which is what a chunk boundary leaves
+        buffer.write(&[7u8; FRAME_BYTE_WIDTH * 2 + 10]);
+
+        buffer.clear_whole_frames();
+
+        // the rest of that third frame arrives after the clear
+        buffer.write(&[9u8; FRAME_BYTE_WIDTH - 10]);
+        let frame = buffer.read(FRAME_BYTE_WIDTH);
+
+        assert_eq!(frame.len(), FRAME_BYTE_WIDTH, "the partial frame completes rather than shifting");
+        assert_eq!(&frame[..10], &[7u8; 10], "and completes with its own leading bytes");
+        assert!(buffer.is_empty(), "nothing is left over");
+    }
+
+    #[test]
+    fn clearing_drops_every_whole_frame() {
+        let mut buffer = RingBuffer::new();
+        buffer.write(&[1u8; FRAME_BYTE_WIDTH * 3]);
+
+        buffer.clear_whole_frames();
+
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn clearing_an_empty_buffer_is_harmless() {
+        let mut buffer = RingBuffer::new();
+
+        buffer.clear_whole_frames();
+
+        assert!(buffer.is_empty());
     }
 
     #[test]

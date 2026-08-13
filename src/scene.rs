@@ -4,14 +4,14 @@ use log::{debug, info, warn};
 use std::process::{Command, Stdio};
 use std::io::Write;
 use std::sync::Arc;
-use std::rc::Rc;
-use cgmath::{Matrix4, Vector3};
+use cgmath::{InnerSpace, Matrix4, Point3, Quaternion};
 use wgpu::{Device, Queue, BindGroupLayout, util::DeviceExt};
 
 use std::collections::HashSet;
 
-use crate::{model, com, text, camera, behaviors_and_entities, ring_buffer, transform_stream};
+use crate::{model, com, text, camera, camera_behavior, behaviors_and_entities, ring_buffer};
 use behaviors_and_entities::{Entity, DISAMBIGUATOR, PATH_SEPARATOR};
+use camera_behavior::{PositionBehavior, RotationBehavior};
 use model::DrawModel;
 
 const BYTES_PER_PIXEL: u32 = 4;
@@ -82,9 +82,106 @@ fn find_shared_sources(consumers: &[(String, String)]) -> Vec<(String, Vec<Strin
         .collect()
 }
 
+/// Speed a camera falls back to when its scene declares no position behavior. The value every
+/// viewport used before behaviors were declarable, so an undeclared camera moves as it always did.
+const DEFAULT_CAMERA_SPEED: f32 = 8.0;
+const DEFAULT_CAMERA_SENSITIVITY: f32 = 0.4;
+
+/// Reads a fixed-length number array out of a command payload, or `None` if it is missing, the
+/// wrong length, or not numeric. Every caller reports the miss and drops the command.
+fn read_floats(json: &serde_json::Value, field: &str, expected: usize) -> Option<Vec<f32>> {
+    let array = json[field].as_array()?;
+    if array.len() != expected {
+        return None;
+    }
+    array.iter().map(|v| v.as_f64().map(|f| f as f32)).collect()
+}
+
+fn read_point(json: &serde_json::Value, field: &str) -> Option<Point3<f32>> {
+    let v = read_floats(json, field, 3)?;
+    Some(Point3::new(v[0], v[1], v[2]))
+}
+
+/// Drops the registry entry a replaced stream was reading, so its buffer and the frames still in
+/// it go with the behavior that wanted them.
+///
+/// Skipped when the incoming behavior reads the same name. The new stream has already bound to
+/// that entry, and `com::write_to_registry` looks entries up with `get` — so removing it would
+/// leave the new stream holding a buffer nothing can ever write to again, and the camera would
+/// stall forever with nothing reporting an error.
+fn release_replaced_stream(
+    replaced: Option<&str>,
+    installed: Option<&str>,
+    registry: &ring_buffer::BufferRegistry,
+) {
+    let Some(source) = replaced else { return };
+    if installed == Some(source) {
+        return;
+    }
+
+    registry.lock().unwrap().remove(source);
+    debug!("released the stream buffer for {}", source);
+}
+
+fn default_position_behavior() -> PositionBehavior {
+    PositionBehavior::FreeRoam { speed: DEFAULT_CAMERA_SPEED }
+}
+
+fn default_rotation_behavior() -> RotationBehavior {
+    RotationBehavior::UserControlled { sensitivity: DEFAULT_CAMERA_SENSITIVITY }
+}
+
+/// Turns one JSON camera `name` into the address the master server uses.
+///
+/// A camera nobody named is addressed by its index in the `viewports` array, exactly as an unnamed
+/// entity is addressed by its index in `entities`. Viewports come from a single scene — the first
+/// to arrive — so that index is stable for the run and predictable to whoever wrote that scene.
+fn normalize_camera_name(raw: &str, index: usize) -> String {
+    if raw.is_empty() {
+        format!("{}{}", DISAMBIGUATOR, index)
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Renames colliding cameras until every name is distinct.
+///
+/// Mirrors `disambiguate_names` for entities, down to suffixing *every* member of a colliding
+/// group rather than letting the first keep the bare name: a command that quietly aimed the wrong
+/// viewport would be harder to spot than one that visibly aimed nothing.
+fn disambiguate_camera_names(names: &mut [String]) {
+    let mut totals: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in names.iter() {
+        *totals.entry(name.clone()).or_insert(0) += 1;
+    }
+
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in names.iter_mut() {
+        let total = totals[name.as_str()];
+        if total < 2 {
+            continue;
+        }
+
+        let occurrence = *seen.entry(name.clone()).or_insert(0);
+        if occurrence == 0 {
+            warn!(
+                "the scene declares {} cameras named {:?}; they are addressable as {}{}0 through \
+                 {}{}{}",
+                total, name, name, DISAMBIGUATOR, name, DISAMBIGUATOR, total - 1,
+            );
+        }
+        *seen.get_mut(name.as_str()).unwrap() += 1;
+        *name = format!("{}{}{}", name, DISAMBIGUATOR, occurrence);
+    }
+}
+
 pub struct Viewport {
     pub rect: model::Rect,
     aspect_ratio: f32,
+    /// What the master server addresses this viewport's camera by. Declared in scene JSON, or the
+    /// viewport's index under `#` when it declares nothing — the same convention entities use for
+    /// the same reason, so an operator who learns one address format can read the other.
+    camera_name: String,
     pub camera_controller: camera::CameraController,
     projection: camera::Projection,
     camera_uniform: camera::CameraUniform,
@@ -102,8 +199,8 @@ impl Viewport {
         y: f32,
         w: f32,
         h: f32,
-        camera: camera::Camera,
-        camera_speed: f32,
+        camera_name: String,
+        camera_controller: camera::CameraController,
         device: &Device,
         camera_bind_group_layout: &BindGroupLayout,
         ortho_matrix_bind_group_layout: &BindGroupLayout,
@@ -112,8 +209,7 @@ impl Viewport {
     ) -> Self {
         let projection = camera::Projection::new(w, h, cgmath::Deg(45.0), 0.1, 100.0);
         let mut camera_uniform = camera::CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, &projection);
-        let camera_controller = camera::CameraController::new(camera_speed, 0.4, camera);
+        camera_uniform.update_view_proj(camera_controller.camera(), &projection);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -153,6 +249,7 @@ impl Viewport {
         Viewport {
             rect,
             aspect_ratio: w / h,
+            camera_name,
             camera_controller,
             projection,
             camera_uniform,
@@ -165,10 +262,16 @@ impl Viewport {
         }
     }
 
+    /// The viewport a scene gets when it declares none: full screen, user-driven.
+    ///
+    /// The HDF5 loader has no scene JSON at all and the JSON loader falls back to this when the
+    /// `viewports` array is missing or empty, so this is the one camera whose behaviors cannot be
+    /// declared anywhere. Free roam under user control is the only default that leaves someone
+    /// able to look around a scene they have just opened.
     fn default(
-        device: &Device, 
-        camera_bind_group_layout: &BindGroupLayout, 
-        ortho_matrix_bind_group_layout: &BindGroupLayout, 
+        device: &Device,
+        camera_bind_group_layout: &BindGroupLayout,
+        ortho_matrix_bind_group_layout: &BindGroupLayout,
     ) -> Self {
         use cgmath::{Deg, Quaternion, Rotation3};
         let camera_yaw = Quaternion::from_angle_z(Deg(-45.0));
@@ -182,8 +285,12 @@ impl Viewport {
             0.0,
             1600.0,
             1200.0,
-            camera,
-            8.0,
+            format!("{}0", DISAMBIGUATOR),
+            camera::CameraController::new(
+                camera,
+                default_position_behavior(),
+                default_rotation_behavior(),
+            ),
             device,
             camera_bind_group_layout,
             ortho_matrix_bind_group_layout,
@@ -194,34 +301,72 @@ impl Viewport {
 
     fn load_from_json(
         json: &serde_json::Value,
+        index: usize,
         device: &Device,
         camera_bind_group_layout: &BindGroupLayout,
         ortho_matrix_bind_group_layout: &BindGroupLayout,
         registry: &ring_buffer::BufferRegistry,
     ) -> Self {
-        let mut viewport = Viewport::new(
+        let camera = {
+            let pos_val = json["camera"]["position"].as_array().unwrap();
+            let pos = cgmath::Point3::new(
+                pos_val[0].as_f64().unwrap() as f32,
+                pos_val[1].as_f64().unwrap() as f32,
+                pos_val[2].as_f64().unwrap() as f32,
+            );
+            let rot_val = json["camera"]["rotation"].as_array().unwrap();
+            let s = rot_val[0].as_f64().unwrap() as f32;
+            let v = cgmath::Vector3::new(
+                rot_val[1].as_f64().unwrap() as f32,
+                rot_val[2].as_f64().unwrap() as f32,
+                rot_val[3].as_f64().unwrap() as f32,
+            );
+            let rot: cgmath::Quaternion<f32> = cgmath::Quaternion::<f32>::from_sv(s, v);
+            camera::Camera::new(pos, rot)
+        };
+
+        let camera_name = normalize_camera_name(json["camera"]["name"].as_str().unwrap_or(""), index);
+
+        // A behavior that will not load is reported and replaced rather than fatal. A scene file
+        // is hand-written and a viewport is the thing you look through: refusing to open the
+        // window over a typo in one camera's speed leaves nothing on screen to read the message
+        // against, and the surviving camera is user-driven, which is the state someone can
+        // recover from by hand.
+        let position_behavior = PositionBehavior::from_json(&json["camera"]["position_behavior"], registry)
+            .unwrap_or_else(|e| {
+                warn!(
+                    "camera {:?}: {}; falling back to a user-driven position — declare a \
+                     \"position_behavior\" on this viewport", camera_name, e,
+                );
+                default_position_behavior()
+            });
+
+        let rotation_behavior = RotationBehavior::from_json(&json["camera"]["rotation_behavior"], registry)
+            .unwrap_or_else(|e| {
+                warn!(
+                    "camera {:?}: {}; falling back to user-driven aim — declare a \
+                     \"rotation_behavior\" on this viewport", camera_name, e,
+                );
+                default_rotation_behavior()
+            });
+
+        let mut camera_controller = camera::CameraController::new(camera, position_behavior, rotation_behavior);
+
+        // Geometry the declared position and the behavior have to agree on — an orbit's axis and
+        // radius. Only reachable after both exist, and a behavior the two cannot agree on is
+        // dropped the same way an unparseable one is.
+        if let Err(e) = camera_controller.prepare_position_behavior() {
+            warn!("camera {:?}: {}; falling back to a user-driven position", camera_name, e);
+            camera_controller.set_position_behavior(default_position_behavior());
+        }
+
+        Viewport::new(
             json["x"].as_f64().unwrap() as f32,
             json["y"].as_f64().unwrap() as f32,
             json["w"].as_f64().unwrap() as f32,
             json["h"].as_f64().unwrap() as f32,
-            {
-                let pos_val = json["camera"]["position"].as_array().unwrap();
-                let pos = cgmath::Point3::new(
-                    pos_val[0].as_f64().unwrap() as f32,
-                    pos_val[1].as_f64().unwrap() as f32,
-                    pos_val[2].as_f64().unwrap() as f32,
-                );
-                let rot_val = json["camera"]["rotation"].as_array().unwrap();
-                let s = rot_val[0].as_f64().unwrap() as f32;
-                let v = cgmath::Vector3::new(
-                    rot_val[1].as_f64().unwrap() as f32,
-                    rot_val[2].as_f64().unwrap() as f32,
-                    rot_val[3].as_f64().unwrap() as f32,
-                );
-                let rot: cgmath::Quaternion<f32> = cgmath::Quaternion::<f32>::from_sv(s, v);
-                camera::Camera::new(pos, rot)
-            },
-            json["camera"]["speed"].as_f64().unwrap_or(8.0) as f32,
+            camera_name,
+            camera_controller,
             device,
             camera_bind_group_layout,
             ortho_matrix_bind_group_layout,
@@ -234,21 +379,9 @@ impl Viewport {
                 )
             },
             BorderAlignment::from_str(json["alignment"].as_str().unwrap()),
-        );
-
-        // A "stream" name puts this camera under wire control for the rest of the run. Absent,
-        // the camera keeps the position and rotation above and stays user-driven. The name is
-        // bound in the registry exactly like an entity's, so a mismatch with what the server
-        // sends fails the same silent way — the camera simply never moves.
-        if let Some(name) = json["camera"]["stream"].as_str() {
-            debug!("viewport camera is stream-driven from {name}");
-            viewport.camera_controller.attach_stream(
-                transform_stream::TransformStream::from_registry(name, registry)
-            );
-        }
-
-        viewport
+        )
     }
+
 
     pub fn resize_from_window(&mut self, screen_width: f32, screen_height: f32, queue: &Queue){
         /*
@@ -301,15 +434,19 @@ impl Viewport {
         );
     }
 
-    pub fn update_camera(
-        &mut self, 
-        dt: std::time::Duration, 
-        queue: &Queue
+    /// Advances this viewport's camera by one frame.
+    ///
+    /// Takes the scene's entities because a camera can be aimed at, or held against, any of them —
+    /// resolved fresh each frame, so a camera keeps working through entities joining and leaving.
+    fn update_camera(
+        &mut self,
+        dt: std::time::Duration,
+        queue: &Queue,
+        entities: &[Entity],
     ){
-        self.camera_controller.update_camera(dt);
+        self.camera_controller.update_camera(dt, entities);
         self.camera_uniform.update_view_proj(&self.camera_controller.camera(), &self.projection);
-        // log::info!("{:?}", viewport.camera_uniform);
-    
+
         queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -606,6 +743,232 @@ impl Scene {
         &mut self.viewports[self.focused_viewport].camera_controller
     }
 
+    /// Advances every camera by one frame.
+    ///
+    /// Lives here rather than in `state.rs` because a camera needs the entity list: iterating the
+    /// viewports mutably while reading entities is only a legal borrow from inside `Scene`, where
+    /// the two are separate fields rather than two paths through one `&mut`.
+    pub fn update_cameras(&mut self, dt: std::time::Duration, queue: &Queue) {
+        let entities = &self.entities;
+        for viewport in &mut self.viewports {
+            viewport.update_camera(dt, queue, entities);
+        }
+    }
+
+    fn find_camera(&self, name: &str) -> Option<usize> {
+        self.viewports.iter().position(|v| v.camera_name == name)
+    }
+
+    /// Acts on one of the master server's camera commands.
+    ///
+    /// Every failure is a warning and a dropped command, never a panic or a partial application: a
+    /// command arrives from another machine over an unauthenticated protocol, and a scene that
+    /// aborted on a malformed one would hand any misconfigured server a way to end the session.
+    /// The log line is the only channel back — the wire is one-way, so the server is never told.
+    pub fn apply_camera_command(
+        &mut self,
+        command: com::ServerCommand,
+        payload: &str,
+        registry: &ring_buffer::BufferRegistry,
+    ) {
+        let json: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("ignoring {:?}: its payload is not valid JSON ({})", command, e);
+                return;
+            }
+        };
+
+        let Some(name) = json["camera"].as_str() else {
+            warn!("ignoring {:?}: its payload names no \"camera\"", command);
+            return;
+        };
+
+        let Some(index) = self.find_camera(name) else {
+            warn!(
+                "ignoring {:?}: no camera named {:?} — this scene has {}",
+                command, name, self.camera_names().join(", "),
+            );
+            return;
+        };
+
+        match command {
+            com::ServerCommand::UPDATE_CAMERA_POSITION_BEHAVIOR => {
+                self.update_camera_position_behavior(index, &json["behavior"], registry)
+            }
+            com::ServerCommand::UPDATE_CAMERA_ROTATION_BEHAVIOR => {
+                self.update_camera_rotation_behavior(index, &json["behavior"], registry)
+            }
+            com::ServerCommand::UPDATE_CAMERA_POSITION => self.update_camera_position(index, &json),
+            com::ServerCommand::UPDATE_CAMERA_ROTATION => self.update_camera_rotation(index, &json),
+            other => warn!("{:?} is not a camera command", other),
+        }
+    }
+
+    fn update_camera_position_behavior(
+        &mut self,
+        index: usize,
+        behavior_json: &serde_json::Value,
+        registry: &ring_buffer::BufferRegistry,
+    ) {
+        let name = self.viewports[index].camera_name.clone();
+
+        let mut behavior = match PositionBehavior::from_json(behavior_json, registry) {
+            Ok(behavior) => behavior,
+            Err(e) => {
+                warn!("ignoring a position behavior for camera {:?}: {}", name, e);
+                return;
+            }
+        };
+
+        // An entity that does not exist yet is a dropped command rather than a behavior that
+        // starts working later. A command is a statement about the scene as it stands, and one
+        // that silently waited would leave the server believing a camera had moved when it had
+        // not — whereas a scene-declared behavior, which cannot know what has connected yet,
+        // does resolve late.
+        if let Some(path) = behavior.entity_path() {
+            if behaviors_and_entities::world_position(&self.entities, path).is_none() {
+                warn!(
+                    "ignoring a position behavior for camera {:?}: no entity at {:?}",
+                    name, path,
+                );
+                return;
+            }
+        }
+
+        let controller = &mut self.viewports[index].camera_controller;
+        let snap = match behavior.prepare(controller.camera().position) {
+            Ok(snap) => snap,
+            Err(e) => {
+                warn!("ignoring a position behavior for camera {:?}: {}", name, e);
+                return;
+            }
+        };
+
+        let replaced = controller.set_position_behavior(behavior);
+        if let Some(position) = snap {
+            controller.set_position(position);
+        }
+        release_replaced_stream(
+            replaced.stream_source(),
+            controller.position_behavior().stream_source(),
+            registry,
+        );
+
+        info!("camera {:?} position behavior is now {}", name, controller.position_behavior().display_name());
+        self.warn_on_shared_stream_sources();
+    }
+
+    fn update_camera_rotation_behavior(
+        &mut self,
+        index: usize,
+        behavior_json: &serde_json::Value,
+        registry: &ring_buffer::BufferRegistry,
+    ) {
+        let name = self.viewports[index].camera_name.clone();
+
+        let behavior = match RotationBehavior::from_json(behavior_json, registry) {
+            Ok(behavior) => behavior,
+            Err(e) => {
+                warn!("ignoring a rotation behavior for camera {:?}: {}", name, e);
+                return;
+            }
+        };
+
+        if let Some(path) = behavior.entity_path() {
+            if behaviors_and_entities::world_position(&self.entities, path).is_none() {
+                warn!(
+                    "ignoring a rotation behavior for camera {:?}: no entity at {:?}",
+                    name, path,
+                );
+                return;
+            }
+        }
+
+        let controller = &mut self.viewports[index].camera_controller;
+        let replaced = controller.set_rotation_behavior(behavior);
+        release_replaced_stream(
+            replaced.stream_source(),
+            controller.rotation_behavior().stream_source(),
+            registry,
+        );
+
+        info!("camera {:?} rotation behavior is now {}", name, controller.rotation_behavior().display_name());
+        self.warn_on_shared_stream_sources();
+    }
+
+    fn update_camera_position(&mut self, index: usize, json: &serde_json::Value) {
+        let name = self.viewports[index].camera_name.clone();
+
+        let Some(position) = read_point(json, "position") else {
+            warn!("ignoring a position for camera {:?}: \"position\" must be three numbers", name);
+            return;
+        };
+
+        let entities = &self.entities;
+        let controller = &mut self.viewports[index].camera_controller;
+        controller.set_position(position);
+
+        // A tracking camera whose entity has since gone is left holding its old offset, which will
+        // pull it off the commanded position on the next frame that entity exists again. Nothing
+        // better is available — there is no offset to derive without the entity — so it is
+        // reported rather than papered over.
+        if let Err(e) = controller.reconcile_commanded_position(entities) {
+            warn!("camera {:?} was moved, but its behavior could not be reconciled: {}", name, e);
+        }
+
+        info!("camera {:?} moved to {:?}", name, position);
+    }
+
+    fn update_camera_rotation(&mut self, index: usize, json: &serde_json::Value) {
+        let name = self.viewports[index].camera_name.clone();
+
+        let Some(values) = read_floats(json, "rotation", 4) else {
+            warn!("ignoring a rotation for camera {:?}: \"rotation\" must be four numbers", name);
+            return;
+        };
+
+        // Normalized rather than trusted: a quaternion that is not unit-length scales every vector
+        // it rotates, so a slightly-off one from the wire would quietly warp the whole view.
+        let rotation = Quaternion::new(values[0], values[1], values[2], values[3]);
+        if !rotation.magnitude2().is_finite() || rotation.magnitude2() < 1e-8 {
+            warn!("ignoring a rotation for camera {:?}: the quaternion has no magnitude", name);
+            return;
+        }
+
+        let controller = &mut self.viewports[index].camera_controller;
+        controller.set_rotation(rotation.normalize());
+        controller.reconcile_commanded_rotation();
+
+        info!("camera {:?} rotated", name);
+    }
+
+    /// Every camera a command can name.
+    pub fn camera_names(&self) -> Vec<String> {
+        self.viewports.iter().map(|v| v.camera_name.clone()).collect()
+    }
+
+    /// Logs a warning for every camera aimed at an entity path that names nothing.
+    ///
+    /// Run at load and after every merge, because that is the whole window in which a legitimate
+    /// unresolved target exists: viewports are built before entities and before any other stream's
+    /// scene has arrived, so a camera in the first scene may name a drone from the third. One that
+    /// is still unresolved holds still and reports nothing on its own, which is indistinguishable
+    /// from a camera that is simply not moving.
+    fn warn_on_unresolved_camera_targets(&self) {
+        for viewport in &self.viewports {
+            for path in viewport.camera_controller.entity_paths() {
+                if behaviors_and_entities::world_position(&self.entities, path).is_none() {
+                    warn!(
+                        "camera {:?} is aimed at {:?}, which no entity in the scene answers to; \
+                         it will hold still until one does",
+                        viewport.camera_name, path,
+                    );
+                }
+            }
+        }
+    }
+
     /// Index of the topmost viewport containing a window-space point, if any.
     ///
     /// Viewports overlap — a `FullScreen` one typically sits under several insets — and `draw`
@@ -891,12 +1254,19 @@ impl Scene {
 
         let mut viewport_vec = Vec::new();
         if let Some(viewport_temp) = json["viewports"].as_array() {
-            for i in viewport_temp.iter() {
-                viewport_vec.push(Viewport::load_from_json(i, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout, &registry));
+            for (index, i) in viewport_temp.iter().enumerate() {
+                viewport_vec.push(Viewport::load_from_json(i, index, &device, &camera_bind_group_layout, ortho_matrix_bind_group_layout, &registry));
             }
         }
         if viewport_vec.is_empty() {
             viewport_vec.push(Viewport::default(&device, &camera_bind_group_layout, ortho_matrix_bind_group_layout));
+        }
+        // One pass settles camera addresses for the run: only the first scene to arrive defines
+        // viewports, so no later scene can add a camera that collides with these.
+        let mut camera_names: Vec<String> = viewport_vec.iter().map(|v| v.camera_name.clone()).collect();
+        disambiguate_camera_names(&mut camera_names);
+        for (viewport, name) in viewport_vec.iter_mut().zip(camera_names) {
+            viewport.camera_name = name;
         }
 
         let entity_temp: Vec<_> = json["entities"]
@@ -937,7 +1307,9 @@ impl Scene {
 
         scene.claimed_namespaces = claimed_namespaces;
         scene.warn_on_shared_stream_sources();
+        scene.warn_on_unresolved_camera_targets();
         scene.log_addressable_paths();
+        info!("addressable cameras: {}", scene.camera_names().join(", "));
         scene
     }
 
@@ -1121,9 +1493,9 @@ impl Scene {
     pub fn warn_on_shared_stream_sources(&self) {
         let mut consumers: Vec<(String, String)> = Vec::new();
 
-        for (i, viewport) in self.viewports.iter().enumerate() {
-            if let Some(name) = viewport.camera_controller.stream_source() {
-                consumers.push((name.to_string(), format!("viewport {} camera", i)));
+        for viewport in self.viewports.iter() {
+            for (source, half) in viewport.camera_controller.stream_sources() {
+                consumers.push((source, format!("camera '{}' {}", viewport.camera_name, half)));
             }
         }
         for entity in &self.entities {
@@ -1181,7 +1553,7 @@ impl Scene {
         // buffer the registry no longer indexes. Must follow the purge, and must cover every
         // viewport rather than one — a stalled camera reports nothing.
         for viewport in &mut self.viewports {
-            viewport.camera_controller.rebind_stream(registry);
+            viewport.camera_controller.rebind_streams(registry);
         }
     }
 
@@ -1196,7 +1568,10 @@ impl Scene {
         if let Some(viewports) = json["viewports"].as_array() {
             if !viewports.is_empty() {
                 let streamed = viewports.iter()
-                    .filter(|v| v["camera"]["stream"].is_string())
+                    .filter(|v| {
+                        v["camera"]["position_behavior"]["type"] == "Streamed"
+                            || v["camera"]["rotation_behavior"]["type"] == "Streamed"
+                    })
                     .count();
                 log::warn!(
                     "ignoring {} viewport definition(s) from a merged scene ({} with a camera \
@@ -1225,6 +1600,10 @@ impl Scene {
         // Re-run after the merge rather than only at load: a stream camera declared by the first
         // scene collides with an entity that only arrives now.
         self.warn_on_shared_stream_sources();
+        // And re-run for the opposite reason: a camera aimed at an entity from another stream's
+        // scene has been holding still until exactly this moment, so a target that is *still*
+        // unresolved after a merge is worth repeating.
+        self.warn_on_unresolved_camera_targets();
         self.log_addressable_paths();
 
         entity_array.len()
@@ -1444,6 +1823,53 @@ mod tests {
             let mut claimed = HashSet::new();
             assert_eq!(claim(&mut claimed, scene), "", "scene {} should not declare", scene);
         }
+    }
+
+    fn strings(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    // A camera nobody named still has to be addressable, and the index used is the one whoever
+    // wrote the scene can predict: its position in that scene's own `viewports` array.
+    #[test]
+    fn an_unnamed_camera_is_addressed_by_its_viewport_index() {
+        assert_eq!(normalize_camera_name("", 0), "#0");
+        assert_eq!(normalize_camera_name("", 2), "#2");
+        assert_eq!(normalize_camera_name("chase", 2), "chase", "a real name ignores the index");
+    }
+
+    // The first duplicate is suffixed too. Leaving it holding the bare name would let a command
+    // aim an arbitrary member of the group, which is worse than aiming nothing.
+    #[test]
+    fn every_colliding_camera_is_suffixed_including_the_first() {
+        let mut names = strings(&["chase", "main", "chase"]);
+
+        disambiguate_camera_names(&mut names);
+
+        assert_eq!(names, strings(&["chase#0", "main", "chase#1"]));
+    }
+
+    #[test]
+    fn distinct_camera_names_are_left_alone() {
+        let mut names = strings(&["main", "chase"]);
+
+        disambiguate_camera_names(&mut names);
+
+        assert_eq!(names, strings(&["main", "chase"]));
+    }
+
+    // A command payload arrives from another machine and is not to be trusted into an index.
+    #[test]
+    fn command_payload_vectors_are_validated_before_use() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"ok": [1.0, 2.0, 3.0], "short": [1.0], "wordy": ["x", "y", "z"], "flat": 3}"#,
+        ).unwrap();
+
+        assert_eq!(read_point(&json, "ok"), Some(Point3::new(1.0, 2.0, 3.0)));
+        assert_eq!(read_point(&json, "short"), None);
+        assert_eq!(read_point(&json, "wordy"), None);
+        assert_eq!(read_point(&json, "flat"), None);
+        assert_eq!(read_point(&json, "absent"), None);
     }
 
     #[test]
