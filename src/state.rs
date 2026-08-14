@@ -687,19 +687,35 @@ impl<'a> State<'a> {
                 label: Some("Render Encoder"),
             });
 
-        {
+        // One render pass per viewport, not one pass for all of them. The depth buffer is shared,
+        // and each viewport fills it with depth from its own camera — a full-screen viewport
+        // drawn first leaves depth under every viewport that overlaps it, so the later ones
+        // depth-test against a foreign camera's geometry and render its silhouette as an
+        // invisible occluder. Scissoring cannot fix that: those depth writes land inside the
+        // offending viewport's own rect. Only a clear between viewports does.
+        //
+        // Depth clears the whole attachment each pass, which is fine because a pass only draws
+        // inside its scissor. Colour must therefore load after the first pass, or each viewport
+        // would wipe the ones drawn before it.
+        for (i, viewport) in self.scene.viewports.iter().enumerate() {
+            let color_load = if i == 0 {
+                wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                })
+            } else {
+                wgpu::LoadOp::Load
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -715,37 +731,35 @@ impl<'a> State<'a> {
                 timestamp_writes: None,
             });
 
-            for viewport in self.scene.viewports.iter() {
-                render_pass.set_scissor_rect(
-                    viewport.rect.x as u32,
-                    viewport.rect.y as u32,
-                    viewport.rect.width as u32,
-                    viewport.rect.height as u32,
-                );
-                render_pass.set_viewport(viewport.rect.x, viewport.rect.y, viewport.rect.width, viewport.rect.height, 0.0, 1.0);
+            render_pass.set_scissor_rect(
+                viewport.rect.x as u32,
+                viewport.rect.y as u32,
+                viewport.rect.width as u32,
+                viewport.rect.height as u32,
+            );
+            render_pass.set_viewport(viewport.rect.x, viewport.rect.y, viewport.rect.width, viewport.rect.height, 0.0, 1.0);
 
-                viewport.draw_background_and_border(
-                    &self.device, 
-                    &mut render_pass,
-                    &self.lines_render_pipeline, 
-                    &self.rect_render_pipeline, 
-                );
-                render_pass.set_pipeline(&self.lines_render_pipeline);
-                render_pass.draw_axes(&self.scene.axes, &viewport.camera_bind_group);
+            viewport.draw_background_and_border(
+                &self.device,
+                &mut render_pass,
+                &self.lines_render_pipeline,
+                &self.rect_render_pipeline,
+            );
+            render_pass.set_pipeline(&self.lines_render_pipeline);
+            render_pass.draw_axes(&self.scene.axes, &viewport.camera_bind_group);
 
-                self.scene.draw(
-                    &mut render_pass,
-                    &viewport.camera_bind_group,
-                    &viewport.ortho_matrix_bind_group,
-                    &self.solid_render_pipeline,
-                    &self.render_pipeline,
-                    &self.lines_render_pipeline,
-                    &self.rect_render_pipeline,
-                    &self.text_render_pipeline,
-                    &self.terrain_render_pipeline,
-                    &self.queue,
-                );
-            }
+            self.scene.draw(
+                &mut render_pass,
+                &viewport.camera_bind_group,
+                &viewport.ortho_matrix_bind_group,
+                &self.solid_render_pipeline,
+                &self.render_pipeline,
+                &self.lines_render_pipeline,
+                &self.rect_render_pipeline,
+                &self.text_render_pipeline,
+                &self.terrain_render_pipeline,
+                &self.queue,
+            );
         }
 
         if should_save_to_file {
