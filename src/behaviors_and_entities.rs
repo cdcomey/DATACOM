@@ -24,8 +24,11 @@ const AVERAGE_REFRESH_RATE: usize = 16;
 const CHUNK_LENGTH: u64 = 1024;
 const MAX_TRAIL_LENGTH: usize = 500;
 
-pub fn create_and_clear_file(file_name: &str) {
+pub fn create_and_clear_file(file_name: &str) -> std::io::Result<()> {
     let path = Path::new(file_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -33,6 +36,8 @@ pub fn create_and_clear_file(file_name: &str) {
         .open(path)
         .unwrap();
     debug!("clearing {file_name}");
+
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone)]
