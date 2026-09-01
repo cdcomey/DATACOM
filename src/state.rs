@@ -37,6 +37,13 @@ pub struct State<'a> {
     /// unconditionally so a click can hit-test the viewport under the cursor — `MouseInput`
     /// carries no coordinates of its own.
     cursor_position: winit::dpi::PhysicalPosition<f64>,
+    /// Frame-time recorder for [`crate::bench`]. Inert unless `DATACOM_BENCH_CSV` is set.
+    pub bench: crate::bench::Recorder,
+    /// Start of the current frame, stamped by `update`. Paired with `bench_update_elapsed`
+    /// so `render` can attribute the scene-update cost to the frame it belongs to — the two
+    /// halves live in separate calls, and only `render` knows when the frame is complete.
+    bench_frame_start: std::time::Instant,
+    bench_update_elapsed: std::time::Duration,
 }
 
 impl<'a> State<'a> {
@@ -176,7 +183,7 @@ impl<'a> State<'a> {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            present_mode: crate::bench::present_mode(&surface_caps.present_modes),
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -481,6 +488,9 @@ impl<'a> State<'a> {
             framerate: 60.0,
             mouse_pressed: false,
             cursor_position: winit::dpi::PhysicalPosition::new(0.0, 0.0),
+            bench: crate::bench::Recorder::from_env(),
+            bench_frame_start: std::time::Instant::now(),
+            bench_update_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -645,6 +655,8 @@ impl<'a> State<'a> {
     }
 
     pub fn update(&mut self, dt: std::time::Duration, should_save_to_file: bool) {
+        self.bench_frame_start = std::time::Instant::now();
+
         self.scene.update_cameras(dt, &self.queue);
 
         self.framerate = dt.as_secs_f32().recip();
@@ -666,19 +678,31 @@ impl<'a> State<'a> {
                 dt
             );
         }
+
+        self.bench_update_elapsed = self.bench_frame_start.elapsed();
     }
 
     pub fn render(&mut self, should_save_to_file: bool) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+        // Benchmark-only: draw into the offscreen texture and never touch the swapchain, so
+        // the measurement excludes the window server entirely. See `crate::bench`.
+        let bench_offscreen = self.bench.enabled() && crate::bench::offscreen();
+
+        let bench_acquire_start = std::time::Instant::now();
+        let output = if bench_offscreen {
+            None
+        } else {
+            Some(self.surface.get_current_texture()?)
+        };
+        let bench_acquire = bench_acquire_start.elapsed();
+        let bench_render_start = std::time::Instant::now();
         let offscreen_view = self.offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .as_ref()
+            .map(|o| o.texture.create_view(&wgpu::TextureViewDescriptor::default()));
 
-        let target = if should_save_to_file {
-            offscreen_view
-        } else {
-            view
+        let target = match view {
+            Some(view) if !should_save_to_file => view,
+            _ => offscreen_view,
         };
 
         let mut encoder = self
@@ -762,7 +786,7 @@ impl<'a> State<'a> {
             );
         }
 
-        if should_save_to_file {
+        if let (true, Some(output)) = (should_save_to_file, output.as_ref()) {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.offscreen_texture,
@@ -785,7 +809,32 @@ impl<'a> State<'a> {
         }
 
         self.queue.submit(iter::once(encoder.finish()));
-        output.present();
+        let bench_render = bench_render_start.elapsed();
+
+        // `submit` returns without waiting for the GPU, so GPU cost would otherwise surface
+        // later as swapchain back-pressure inside `acquire_ms`. The baseline's OpenGL draw
+        // calls block in the driver instead, putting its GPU cost inside its own render span
+        // — so without this wait the two render spans would not be measuring the same thing.
+        // Costs the CPU/GPU overlap, hence benchmark-only. See `crate::bench`.
+        let bench_gpu_start = std::time::Instant::now();
+        if self.bench.enabled() && crate::bench::gpu_sync() {
+            let _ = self.device.poll(wgpu::PollType::Wait);
+        }
+        let bench_gpu = bench_gpu_start.elapsed();
+
+        let bench_present_start = std::time::Instant::now();
+        if let Some(output) = output {
+            output.present();
+        }
+
+        self.bench.record(
+            self.bench_frame_start,
+            self.bench_update_elapsed,
+            bench_acquire,
+            bench_render,
+            bench_gpu,
+            bench_present_start.elapsed(),
+        );
 
         Ok(())
     }

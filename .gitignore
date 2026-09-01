@@ -16,3 +16,8 @@ tmp.py
 .DS_Store
 Cargo.lock
 CLAUDE.md
+# Benchmark suite (bench/) generated artifacts
+/bench/.baseline
+/bench/results
+/bench/scenes
+/data/scene_loading/bench

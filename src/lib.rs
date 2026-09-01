@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use log::{info, debug};
 use std::fs::remove_file;
 
+mod bench;
 mod behaviors_and_entities;
 mod ring_buffer;
 mod transform_stream;
@@ -26,10 +27,13 @@ pub fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
 
     let event_loop = EventLoop::new().unwrap();
     let title = env!("CARGO_PKG_NAME");
-    let window = winit::window::WindowBuilder::new()
-        .with_title(title)
-        .build(&event_loop)
-        .unwrap();
+    let mut window_builder = winit::window::WindowBuilder::new().with_title(title);
+    // The benchmark suite pins the window size so the wgpu and glium runs shade the same
+    // number of pixels; without it the two window defaults are what gets compared.
+    if let Some((w, h)) = bench::window_size() {
+        window_builder = window_builder.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+    }
+    let window = window_builder.build(&event_loop).unwrap();
 
     let mut scene_file_string = String::from("data/scene_loading/");
     scene_file_string.push_str(&args[1]);
@@ -41,6 +45,13 @@ pub fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
 
     event_loop
         .run(move |event, control_flow| {
+            // Frames are normally driven by `request_redraw` under the default `Wait`, which
+            // macOS coalesces to one redraw per display refresh — a cap the swapchain's
+            // present mode cannot lift. Polling while benchmarking is what actually uncaps it.
+            if state.bench.enabled() {
+                control_flow.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            }
+
             match event {
                 Event::DeviceEvent {
                     ref event,
@@ -97,6 +108,11 @@ pub fn run_scene_from_json(args: Vec<String>, should_save_to_file: bool) {
                                 Err(wgpu::SurfaceError::Timeout) => {
                                     log::warn!("Surface timeout")
                                 }
+                            }
+
+                            if state.bench.finished() {
+                                state.bench.flush();
+                                control_flow.exit();
                             }
                         }
                         _ => {}
