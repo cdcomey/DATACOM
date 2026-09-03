@@ -483,7 +483,11 @@ impl Rect {
     ) {
         render_pass.set_pipeline(rect_render_pipeline);
 
-        let corners = Rect::get_border_corners(self.x, self.y, self.width, self.height, Rect::BACKGROUND_COLOR);
+        // Local coordinates, not `self.x`/`self.y`. This rect's ortho matrix spans
+        // `0..width, 0..height` (the viewport's own size), and `set_viewport` has already mapped
+        // NDC onto the viewport's slot in the window — so window-space corners get transformed a
+        // second time and land off-screen for every viewport that is not at the origin.
+        let corners = Rect::get_border_corners(0.0, 0.0, self.width, self.height, Rect::BACKGROUND_COLOR);
         let bg = vec![
             corners[0],
             corners[1],
@@ -504,8 +508,28 @@ impl Rect {
         render_pass.set_bind_group(1, ortho_matrix_bind_group, &[]);
         render_pass.draw(0..6, 0..1);
 
+        // Built here rather than reused from `self.vertex_buffer` for the same reason, plus that
+        // buffer is baked at construction and never rebuilt, so it is also stale after a resize.
+        let border_corners = Rect::get_border_corners(0.0, 0.0, self.width, self.height, self.color);
+        let border = vec![
+            border_corners[0],
+            border_corners[1],
+            border_corners[1],
+            border_corners[2],
+            border_corners[2],
+            border_corners[3],
+            border_corners[3],
+            border_corners[0],
+        ];
+
+        let border_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Viewport Border Buffer"),
+            contents: bytemuck::cast_slice(&border),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         render_pass.set_pipeline(lines_render_pipeline);
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(0, border_buffer.slice(..));
         render_pass.draw(0..Rect::NUM_VERTICES, 0..1);
     }
 }

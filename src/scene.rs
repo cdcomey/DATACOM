@@ -398,6 +398,12 @@ impl Viewport {
         // println!("resize from window called");
         // println!("new screen dims: {}, {}", screen_width, screen_height);
         if self.alignment == BorderAlignment::FullScreen {
+            // Both dimensions. Height alone leaves the rect at whatever width the scene JSON
+            // declared, so growing the window past that width leaves `set_viewport` and
+            // `set_scissor_rect` covering only the left part of the framebuffer — everything to
+            // the right of the original width is never drawn into, which reads as a hard vertical
+            // line with the scene cut off beyond it.
+            self.rect.width = screen_width;
             self.rect.height = screen_height;
         }
         if self.alignment == BorderAlignment::TopRight || self.alignment == BorderAlignment::BottomRight {
@@ -409,6 +415,13 @@ impl Viewport {
         }
 
         self.projection.resize(self.rect.width, self.rect.height);
+        self.aspect_ratio = self.rect.width / self.rect.height;
+
+        // Rebuilt, not just re-uploaded. This matrix maps the viewport's own `0..width, 0..height`
+        // space onto NDC, so a resize that changes the rect and reuses the old matrix leaves every
+        // ortho-space draw — the background, the border, the progress bar — scaled for the
+        // previous size.
+        self.ortho_transform_matrix = cgmath::ortho(0.0, self.rect.width, self.rect.height, 0.0, -1.0, 1.0);
 
         let ortho_transform_arr: [[f32; 4]; 4] = self.ortho_transform_matrix.into();
         queue.write_buffer(
